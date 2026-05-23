@@ -345,6 +345,24 @@ catch_discover_tests(test-punctuation-policy
     PROPERTIES LABELS "unit"
 )
 
+# ─── test - diarize - global — Catch2 unit tests for global diarization logic (#110)
+add_executable(test-diarize-global
+    test_diarize_global.cpp
+)
+target_include_directories(test-diarize-global PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+    ${PROJECT_SOURCE_DIR}/examples/cli
+)
+target_link_libraries(test-diarize-global PRIVATE
+    Catch2::Catch2WithMain
+    common
+)
+catch_discover_tests(test-diarize-global
+    TEST_SPEC "[diarize]"
+    PROPERTIES LABELS "unit;diarize"
+)
+
 # ─── test - paraformer — live integration tests for paraformer backend
 add_executable(test-paraformer
     test_paraformer.cpp

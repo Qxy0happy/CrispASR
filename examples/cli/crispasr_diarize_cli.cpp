@@ -286,6 +286,110 @@ std::string resolve_pyannote_model(const whisper_params& params) {
     return mp;
 }
 
+// Assign speakers from a pre-computed global sherpa timeline.
+// Same logic as assign_speakers_from_sherpa but also splits segments
+// at speaker-turn boundaries when word timestamps are available.
+void assign_speakers_from_global_sherpa(std::vector<crispasr_segment>& segs,
+                                        const CrispasrSherpaCache& cache) {
+    if (!cache.valid() || segs.empty())
+        return;
+
+    // Convert cache segments to the local SherpaSegment type for reuse
+    std::vector<SherpaSegment> sherpa_segs;
+    sherpa_segs.reserve(cache.segments.size());
+    for (const auto& cs : cache.segments)
+        sherpa_segs.push_back({cs.t0_s, cs.t1_s, cs.speaker});
+
+    // Phase 1: assign dominant speaker to each whole ASR segment
+    assign_speakers_from_sherpa(segs, sherpa_segs);
+
+    // Phase 2: split segments at speaker-turn boundaries using word timestamps
+    std::vector<crispasr_segment> out;
+    out.reserve(segs.size());
+
+    for (auto& seg : segs) {
+        if (seg.words.empty()) {
+            out.push_back(std::move(seg));
+            continue;
+        }
+
+        // Per-word speaker label from global timeline
+        std::vector<int> word_spk(seg.words.size(), -1);
+        for (size_t i = 0; i < seg.words.size(); i++) {
+            const auto& w = seg.words[i];
+            if (w.t1 <= w.t0)
+                continue;
+            const double w0 = (double)w.t0 / 100.0;
+            const double w1 = (double)w.t1 / 100.0;
+            // Find the sherpa segment with maximum overlap
+            int best = -1;
+            double best_ov = 0.0;
+            for (const auto& s : sherpa_segs) {
+                double lo = std::max(w0, s.t0_s);
+                double hi = std::min(w1, s.t1_s);
+                if (hi > lo && (hi - lo) > best_ov) {
+                    best_ov = hi - lo;
+                    best = s.speaker;
+                }
+            }
+            word_spk[i] = best;
+        }
+
+        // Carry-forward for unaligned words
+        int last_known = -1;
+        for (size_t i = 0; i < word_spk.size(); i++) {
+            if (word_spk[i] >= 0)
+                last_known = word_spk[i];
+            else if (last_known >= 0)
+                word_spk[i] = last_known;
+        }
+        // Back-fill leading unknowns
+        for (size_t i = 0; i < word_spk.size() && word_spk[i] < 0; i++) {
+            for (size_t j = i + 1; j < word_spk.size(); j++) {
+                if (word_spk[j] >= 0) { word_spk[i] = word_spk[j]; break; }
+            }
+        }
+
+        // Check if all words have the same speaker — skip splitting if so
+        bool all_same = true;
+        for (size_t i = 1; i < word_spk.size(); i++) {
+            if (word_spk[i] != word_spk[0]) { all_same = false; break; }
+        }
+        if (all_same) {
+            out.push_back(std::move(seg));
+            continue;
+        }
+
+        // Split at speaker transitions
+        size_t run_start = 0;
+        for (size_t i = 1; i <= seg.words.size(); i++) {
+            if (i < seg.words.size() && word_spk[i] == word_spk[run_start])
+                continue;
+            // Emit sub-segment [run_start, i)
+            crispasr_segment sub;
+            sub.t0 = seg.words[run_start].t0 > 0 ? seg.words[run_start].t0 : seg.t0;
+            sub.t1 = seg.words[i - 1].t1 > 0 ? seg.words[i - 1].t1 : seg.t1;
+            if (word_spk[run_start] >= 0)
+                sub.speaker = "(speaker " + std::to_string(word_spk[run_start]) + ") ";
+            else
+                sub.speaker = seg.speaker;
+            // Rebuild text from words
+            std::string txt;
+            for (size_t j = run_start; j < i; j++) {
+                if (!txt.empty()) txt += ' ';
+                txt += seg.words[j].text;
+            }
+            sub.text = txt;
+            // Copy word data for the sub-segment
+            sub.words.assign(seg.words.begin() + run_start, seg.words.begin() + i);
+            out.push_back(std::move(sub));
+            run_start = i;
+        }
+    }
+
+    segs = std::move(out);
+}
+
 } // namespace
 
 namespace {
@@ -504,9 +608,68 @@ bool crispasr_compute_pyannote_cache(const float* full_audio, int n_samples, con
     return true;
 }
 
+bool crispasr_compute_sherpa_cache(const float* full_audio, int n_samples, const whisper_params& params,
+                                   CrispasrSherpaCache& out) {
+    out = {};
+    if (!full_audio || n_samples <= 0) return false;
+
+    const std::string bin =
+        params.sherpa_bin.empty() ? std::string("sherpa-onnx-offline-speaker-diarization") : params.sherpa_bin;
+    if (params.sherpa_segment_model.empty() || params.sherpa_embedding_model.empty()) {
+        fprintf(stderr, "crispasr[diarize]: sherpa global cache needs --sherpa-segment-model and\n"
+                        "                   --sherpa-embedding-model.\n");
+        return false;
+    }
+
+    if (!params.no_prints)
+        fprintf(stderr, "crispasr[diarize]: computing global sherpa timeline over %d samples (%.1f s)...\n",
+                n_samples, (double)n_samples / 16000.0);
+
+    const std::string wav_path = write_temp_mono_wav(full_audio, n_samples);
+    if (wav_path.empty()) {
+        fprintf(stderr, "crispasr[diarize]: failed to write temp wav for global sherpa\n");
+        return false;
+    }
+
+    std::ostringstream cmd;
+    cmd << bin
+        << " --clustering.num-clusters=" << params.sherpa_num_clusters
+        << " --segmentation.pyannote-model='" << params.sherpa_segment_model << "'"
+        << " --embedding.model='" << params.sherpa_embedding_model << "'"
+        << " '" << wav_path << "'";
+    if (!params.no_prints)
+        fprintf(stderr, "crispasr[diarize]: %s\n", cmd.str().c_str());
+    cmd << " 2>/dev/null";
+
+    std::unique_ptr<FILE, int (*)(FILE*)> pipe(popen(cmd.str().c_str(), "r"), pclose);
+    if (!pipe) {
+        fprintf(stderr, "crispasr[diarize]: failed to spawn sherpa subprocess for global cache\n");
+        std::remove(wav_path.c_str());
+        return false;
+    }
+
+    char linebuf[1024];
+    while (fgets(linebuf, sizeof(linebuf), pipe.get())) {
+        SherpaSegment s;
+        if (parse_sherpa_line(linebuf, s))
+            out.segments.push_back({s.t0_s, s.t1_s, s.speaker});
+    }
+    std::remove(wav_path.c_str());
+
+    if (out.segments.empty()) {
+        fprintf(stderr, "crispasr[diarize]: sherpa global run produced no segments\n");
+        return false;
+    }
+
+    if (!params.no_prints)
+        fprintf(stderr, "crispasr[diarize]: sherpa global → %zu speaker regions\n", out.segments.size());
+    return true;
+}
+
 bool crispasr_apply_diarize(const std::vector<float>& left, const std::vector<float>& right, bool is_stereo,
                             int64_t slice_t0_cs, std::vector<crispasr_segment>& segs, const whisper_params& params,
-                            const CrispasrPyannoteCache* pyannote_cache) {
+                            const CrispasrPyannoteCache* pyannote_cache,
+                            const CrispasrSherpaCache* sherpa_cache) {
     if (segs.empty())
         return true;
 
@@ -556,6 +719,15 @@ bool crispasr_apply_diarize(const std::vector<float>& left, const std::vector<fl
         // boundaries (#107). Segments without word timestamps keep
         // their Phase 1 single-speaker label.
         split_segments_on_pyannote_turns(segs, *pyannote_cache);
+        return true;
+    }
+
+    // Sherpa cache short-circuit (issue #110): when the runner pre-computed
+    // the global sherpa speaker timeline over the full audio, use it
+    // directly instead of re-invoking the subprocess per slice.
+    if (sherpa_cache && sherpa_cache->valid() &&
+        (method == "sherpa" || method == "sherpa-onnx" || method == "ecapa" || !use_lib)) {
+        assign_speakers_from_global_sherpa(segs, *sherpa_cache);
         return true;
     }
 

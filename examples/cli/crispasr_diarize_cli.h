@@ -47,6 +47,32 @@ struct CrispasrPyannoteCache {
 bool crispasr_compute_pyannote_cache(const float* full_audio, int n_samples, const whisper_params& params,
                                      CrispasrPyannoteCache& out);
 
+/// Cached global sherpa-onnx speaker-diarization timeline. Built once
+/// over the full audio at the start of a run (issue #110 — avoids
+/// per-slice sherpa invocations that reset local speaker IDs across
+/// slices and produce inconsistent labels).
+///
+/// `segments` holds the globally-parsed speaker regions with absolute
+/// timestamps. When this cache is passed to `crispasr_apply_diarize`,
+/// the sherpa subprocess is NOT re-invoked; instead the per-slice
+/// ASR segments are scored against the pre-computed global timeline.
+struct CrispasrSherpaCache {
+    struct Segment {
+        double t0_s;
+        double t1_s;
+        int speaker;
+    };
+    std::vector<Segment> segments;
+    bool valid() const { return !segments.empty(); }
+};
+
+/// Run sherpa-onnx-offline-speaker-diarization once over the full mono
+/// 16 kHz audio and parse the global speaker-turn timeline.
+/// Returns true on success; `out` is populated with speaker regions.
+bool crispasr_compute_sherpa_cache(const float* full_audio, int n_samples,
+                                   const whisper_params& params,
+                                   CrispasrSherpaCache& out);
+
 /// Top-level CLI diarize post-step.
 ///
 /// Routes `params.diarize_method` to either the shared library methods
@@ -67,7 +93,8 @@ bool crispasr_compute_pyannote_cache(const float* full_audio, int n_samples, con
 /// ID consistency (#107).
 bool crispasr_apply_diarize(const std::vector<float>& left, const std::vector<float>& right, bool is_stereo,
                             int64_t slice_t0_cs, std::vector<crispasr_segment>& segs, const whisper_params& params,
-                            const CrispasrPyannoteCache* pyannote_cache = nullptr);
+                            const CrispasrPyannoteCache* pyannote_cache = nullptr,
+                            const CrispasrSherpaCache* sherpa_cache = nullptr);
 
 /// Re-label each segment's speaker by clustering speaker embeddings
 /// extracted from `full_audio`. Operates over the WHOLE finalized

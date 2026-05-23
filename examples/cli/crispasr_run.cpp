@@ -588,6 +588,29 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
     // pyannote — otherwise we incur no extra cost. Stereo input is
     // downmixed to mono for pyannote (matches what apply_pyannote does
     // when called per-slice today).
+    // Issue #110: global sherpa pre-compute. Run sherpa once over the
+    // full audio (instead of per-slice) so speaker IDs are globally stable.
+    CrispasrSherpaCache sherpa_cache;
+    if (params.diarize &&
+        (params.diarize_method == "sherpa" || params.diarize_method == "sherpa-onnx" ||
+         params.diarize_method == "ecapa") &&
+        !samples.empty()) {
+        const float* full = samples.data();
+        std::vector<float> mono_buf;
+        if (have_stereo && !stereo[0].empty() && !stereo[1].empty()) {
+            const size_t n = std::min(stereo[0].size(), stereo[1].size());
+            mono_buf.resize(n);
+            for (size_t i = 0; i < n; i++)
+                mono_buf[i] = 0.5f * (stereo[0][i] + stereo[1][i]);
+            full = mono_buf.data();
+        }
+        const int n_samples_full = (int)samples.size();
+        if (!crispasr_compute_sherpa_cache(full, n_samples_full, params, sherpa_cache)) {
+            // Cache build failed — fall back to per-slice sherpa.
+            sherpa_cache = {};
+        }
+    }
+
     CrispasrPyannoteCache pyannote_cache;
     if (params.diarize && params.diarize_method == "pyannote" && !samples.empty()) {
         const float* full = samples.data();
@@ -696,15 +719,16 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
         }
 
         if (params.diarize && !segs.empty()) {
-            const CrispasrPyannoteCache* cache_ptr = pyannote_cache.valid() ? &pyannote_cache : nullptr;
+            const CrispasrPyannoteCache* pya_ptr = pyannote_cache.valid() ? &pyannote_cache : nullptr;
+            const CrispasrSherpaCache* shp_ptr = sherpa_cache.valid() ? &sherpa_cache : nullptr;
             if (have_stereo) {
                 std::vector<float> sl_l(stereo[0].begin() + sl.start, stereo[0].begin() + sl.end);
                 std::vector<float> sl_r(stereo[1].begin() + sl.start, stereo[1].begin() + sl.end);
-                crispasr_apply_diarize(sl_l, sl_r, /*is_stereo=*/true, sl.t0_cs, segs, params, cache_ptr);
+                crispasr_apply_diarize(sl_l, sl_r, /*is_stereo=*/true, sl.t0_cs, segs, params, pya_ptr, shp_ptr);
             } else {
                 std::vector<float> mono_slice(samples.begin() + sl.start, samples.begin() + sl.end);
                 crispasr_apply_diarize(mono_slice, mono_slice,
-                                       /*is_stereo=*/false, sl.t0_cs, segs, params, cache_ptr);
+                                       /*is_stereo=*/false, sl.t0_cs, segs, params, pya_ptr, shp_ptr);
             }
         }
 
