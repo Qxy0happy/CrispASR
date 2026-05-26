@@ -1147,6 +1147,29 @@ int crispasr_run_backend(const whisper_params& params_in) {
     }
     params.model = resolved;
 
+    // Issue #125 follow-up: when the LM has a companion file in the
+    // registry (e.g. mimo-tokenizer-q4_k.gguf for mimo-asr), fetch it now
+    // so `--auto-download` produces a fully-functional setup. Previously
+    // companion-fetch was wired only into TTS backends (chatterbox /
+    // orpheus / indextts / qwen3-tts), so ASR backends with a hard
+    // companion dependency (mimo-asr) hit "not found" errors even with
+    // --auto-download set. Doing it here in the dispatcher covers every
+    // current and future backend uniformly. Companion lands in the same
+    // cache_dir as the LM so the backend's local `discover_*` finds it.
+    if (!backend_name.empty()) {
+        CrispasrRegistryEntry entry;
+        if (crispasr_registry_lookup(backend_name, entry, params.model_quant) && !entry.companion_filename.empty()) {
+            const std::string resolved_companion =
+                crispasr_resolve_model_cli(entry.companion_filename, backend_name, params.no_prints, params.cache_dir,
+                                           params.auto_download, params.model_quant);
+            if (params.verbose) {
+                fprintf(stderr, "crispasr[verbose]: resolved companion = '%s'\n", resolved_companion.c_str());
+            }
+            // Soft-fail: backend init prints its own actionable error if
+            // the companion is genuinely required and didn't resolve.
+        }
+    }
+
     // SubtitleEdit #10775: implicit `-am auto --force-aligner` for
     // canary when the user requests word-level output but didn't
     // pass an aligner. Canary's native timing is cross-attention DTW
