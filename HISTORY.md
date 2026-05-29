@@ -6,6 +6,36 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-29 omniasr-ctc-300m: blank_id fix + CTC auto-chunking + omniasr-300m backend
+
+Three fixes for the OmniASR CTC backend, resolving the empty-output bug
+on the 300M model and wiring it as a first-class named backend:
+
+1. **CTC blank_id = 0** (was `hp.bos_id`, which differs between v1 and
+   v2 GGUFs). Both fairseq2 and HF Wav2Vec2ForCTC train with
+   `torch.nn.functional.ctc_loss(blank=0)`.
+
+2. **CTC auto-chunking**: the 300M model's positional encoding (conv1d
+   kernel=128, groups=16) degrades beyond ~7 s of audio. The backend
+   adapter now auto-splits audio >7 s into 5 s chunks with 0.5 s overlap
+   for CTC variants. The 1B model handles all lengths.
+
+3. **`omniasr-300m` named backend**: registry entry pointing to
+   `cstr/omniASR-CTC-300M-v2-GGUF` Q4_K (~194 MB), CLI alias,
+   available_backends in C ABI, feature-matrix row.
+
+Root cause of the empty output: the GGUF was converted from the v1
+fairseq2 `.pt` checkpoint, which produces garbage in both Python and C++
+inference. Only the v2 (HF transformers format) model works — the v1
+format requires fairseq2's internal weight-loading pipeline which applies
+weight-norm materialization that our converter replicates correctly
+(verified: max diff < 1e-6) but the model still fails, suggesting deeper
+incompatibility (possibly different GELU variant, dropout mask, or
+attention implementation). The converter already auto-detects v1 vs v2;
+only v2 produces usable GGUFs.
+
+---
+
 ## 2026-05-29 cosyvoice3: Phase 6 — native arbitrary-WAV cloning (s3tokenizer_v3 byte-exact)
 
 Adds runtime voice cloning from any 16 kHz WAV

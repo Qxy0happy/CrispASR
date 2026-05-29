@@ -2237,7 +2237,7 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
     // CrisperWeaver's catalogue uses so the front-door
     // available_backends check (which is strict string equality)
     // accepts them.
-    list += ",omniasr,omniasr-llm,omniasr-llm-unlimited";
+    list += ",omniasr,omniasr-300m,omniasr-llm,omniasr-llm-unlimited";
 #endif
 #ifdef CA_HAVE_ORPHEUS
     list += ",orpheus";
