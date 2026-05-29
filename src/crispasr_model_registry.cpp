@@ -202,6 +202,8 @@ constexpr Entry k_registry[] = {
      "https://huggingface.co/cstr/mimo-tokenizer-GGUF/resolve/main/mimo-tokenizer-q4_k.gguf"},
     {"omniasr", "omniasr-ctc-1b-v2-q4_k.gguf",
      "https://huggingface.co/cstr/omniASR-CTC-1B-v2-GGUF/resolve/main/omniasr-ctc-1b-v2-q4_k.gguf", "~658 MB", nullptr, nullptr},
+    {"omniasr-300m", "omniasr-ctc-300m-v2-q4_k.gguf",
+     "https://huggingface.co/cstr/omniASR-CTC-300M-v2-GGUF/resolve/main/omniasr-ctc-300m-v2-q4_k.gguf", "~194 MB", nullptr, nullptr},
     {"omniasr-llm", "omniasr-llm-300m-v2-q4_k.gguf",
      "https://huggingface.co/cstr/omniasr-llm-300m-v2-GGUF/resolve/main/omniasr-llm-300m-v2-q4_k.gguf", "~1019 MB", nullptr, nullptr},
     {"omniasr-llm-1b", "omniasr-llm-1b-q4_k.gguf",

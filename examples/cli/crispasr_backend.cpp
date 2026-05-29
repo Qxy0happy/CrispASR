@@ -188,6 +188,7 @@ std::vector<std::string> crispasr_list_backends() {
         "moonshine-streaming",
         "gemma4-e2b",
         "omniasr",
+        "omniasr-300m",
         "omniasr-llm",
         "omniasr-llm-1b",
         "mimo-asr",
@@ -528,8 +529,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 return "gemma4-e2b";
             else if (a == "moonshine" || a == "moonshine-tiny" || a == "moonshine-base")
                 result = "moonshine";
-            else if (a == "omniasr-ctc" || a == "omniasr_ctc" || a == "omniasr" || a == "omniasr-llm" ||
-                     a == "omniasr_llm")
+            else if (a == "omniasr-ctc" || a == "omniasr_ctc" || a == "omniasr" || a == "omniasr-300m" ||
+                     a == "omniasr-llm" || a == "omniasr_llm")
                 result = "omniasr";
             else if (a == "hubert" || a == "hubert-ctc")
                 result = "wav2vec2";
