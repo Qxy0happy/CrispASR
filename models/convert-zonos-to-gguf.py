@@ -129,19 +129,24 @@ def map_tensor_name(hf_name: str) -> str | None:
     """Map HuggingFace weight name to GGUF tensor name."""
     n = hf_name
 
+    # Final norm (must be done before the .norm. replacement below)
+    n = n.replace("backbone.norm_f.", "backbone.output_norm.")
+
     # Backbone transformer layers
     n = n.replace("backbone.layers.", "backbone.blk.")
     n = n.replace(".mixer.in_proj.", ".attn_qkv.")  # fused Q/K/V
     n = n.replace(".mixer.out_proj.", ".attn_output.")
     n = n.replace(".mlp.fc1.", ".ffn_gate_up.")  # fused gate+up (SwiGLU)
     n = n.replace(".mlp.fc2.", ".ffn_down.")
-    n = n.replace(".norm.", ".attn_norm.")       # pre-attn LayerNorm
-    n = n.replace(".norm2.", ".ffn_norm.")        # pre-FFN LayerNorm
 
-    # Final norm
-    n = n.replace("backbone.norm_f.", "backbone.output_norm.")
+    # Pre-FFN LayerNorm (.norm2. must be replaced BEFORE .norm.)
+    n = n.replace(".norm2.", ".ffn_norm.")
 
-    # Codebook embeddings and heads (keep as-is, just prefix)
+    # Pre-attn LayerNorm -- only inside backbone.blk.N, not prefix_conditioner
+    if n.startswith("backbone.blk.") and ".norm." in n:
+        n = n.replace(".norm.", ".attn_norm.")
+
+    # Codebook embeddings and heads (keep as-is)
     # embeddings.K.weight -> embeddings.K.weight
     # heads.K.weight -> heads.K.weight
 
@@ -318,14 +323,32 @@ def main():
             tensor = f.get_tensor(hf_name)
             shape = list(tensor.shape)
 
-            # Convert bfloat16 to float16 for GGUF compatibility
+            # Choose quantization
+            qtype = choose_quant(gguf_name, shape, args.quant)
+
+            # Convert to the target numpy dtype.
+            # BF16 must go through F32 first (numpy has no bf16).
             if tensor.dtype == torch.bfloat16:
                 tensor = tensor.float()
 
-            data = tensor.numpy()
-
-            # Choose quantization
-            qtype = choose_quant(gguf_name, shape, args.quant)
+            if qtype == GGMLQuantizationType.F32:
+                data = np.ascontiguousarray(tensor.float().numpy())
+            elif qtype == GGMLQuantizationType.F16:
+                data = np.ascontiguousarray(tensor.float().numpy().astype(np.float16))
+            elif qtype in (GGMLQuantizationType.Q8_0, GGMLQuantizationType.Q4_0,
+                           GGMLQuantizationType.Q4_1, GGMLQuantizationType.Q5_0,
+                           GGMLQuantizationType.Q5_1):
+                data_f32 = np.ascontiguousarray(tensor.float().numpy())
+                try:
+                    data = gguf.quantize(data_f32, qtype)
+                except Exception as e:
+                    print(f"  [WARN] {gguf_name}: quantize failed ({e}), keeping F16",
+                          file=sys.stderr)
+                    data = np.ascontiguousarray(tensor.float().numpy().astype(np.float16))
+                    qtype = GGMLQuantizationType.F16
+            else:
+                data = np.ascontiguousarray(tensor.float().numpy().astype(np.float16))
+                qtype = GGMLQuantizationType.F16
 
             writer.add_tensor(gguf_name, data, raw_dtype=qtype)
             n_written += 1

@@ -220,16 +220,18 @@ def main():
         tensor = state_dict[hf_name]
         if tensor.dtype == torch.bfloat16:
             tensor = tensor.float()
-        data = tensor.float().numpy()
-        shape = list(data.shape)
+        shape = list(tensor.shape)
 
-        # Choose dtype
+        # Choose dtype: 1D -> F32, 2D -> F16 or F32
         if len(shape) == 1:
             qtype = GGMLQuantizationType.F32
+            data = np.ascontiguousarray(tensor.float().numpy())
         elif args.quant == "f16":
             qtype = GGMLQuantizationType.F16
+            data = np.ascontiguousarray(tensor.float().numpy().astype(np.float16))
         else:
             qtype = GGMLQuantizationType.F32
+            data = np.ascontiguousarray(tensor.float().numpy())
 
         writer.add_tensor(gguf_name, data, raw_dtype=qtype)
         n_written += 1
