@@ -647,7 +647,7 @@ static bool init_dd_kv_cache(csm_tts_context* ctx) {
 
 static std::vector<int32_t> tokenize_text(const csm_model& m, const std::string& text) {
     // Use the core BPE tokenizer with the model's vocab and merges.
-    return core_bpe::encode(text, m.token_to_id, m.merge_rank);
+    return core_bpe::tokenize_simple(m.token_to_id, m.merge_rank, text);
 }
 
 // ===================================================================

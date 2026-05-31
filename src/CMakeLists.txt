@@ -1111,6 +1111,18 @@ if(NOT MSVC)
     target_compile_options(fastpitch-tts PRIVATE -O3)
 endif()
 
+# ---------------------------------------------------------------------------
+# csm-tts — Sesame CSM-1B TTS (native ggml runtime)
+# ---------------------------------------------------------------------------
+add_library(csm-tts STATIC csm_tts.h csm_tts.cpp)
+set_target_properties(csm-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(csm-tts PUBLIC .)
+target_compile_features   (csm-tts PUBLIC cxx_std_17)
+target_link_libraries     (csm-tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(csm-tts PRIVATE -O3)
+endif()
+
 # piper-tts — rhasspy/piper VITS TTS (native ggml runtime)
 # ---------------------------------------------------------------------------
 add_library(piper-tts STATIC piper_tts.h piper_tts.cpp)
