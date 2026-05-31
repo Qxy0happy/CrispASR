@@ -108,6 +108,92 @@ struct bark_fine_model {
     std::vector<ggml_tensor*> output_heads; // [n_codes_total - n_codes_given] lm heads
 };
 
+// BERT WordPiece tokenizer (cased, no lowering -- bert-base-multilingual-cased)
+struct bark_wordpiece_tokenizer {
+    std::vector<std::string> id_to_token;
+    std::map<std::string, int> token_to_id;
+    int unk_id = 100; // [UNK]
+    bool loaded = false;
+
+    void build_map() {
+        token_to_id.clear();
+        for (int i = 0; i < (int)id_to_token.size(); i++) {
+            if (!id_to_token[(size_t)i].empty()) {
+                token_to_id[id_to_token[(size_t)i]] = i;
+            }
+        }
+        loaded = !id_to_token.empty();
+    }
+
+    // BERT WordPiece tokenization (cased -- NO lowering)
+    // Splits on whitespace + punctuation, then greedily matches longest subword.
+    std::vector<int> tokenize(const std::string& text) const {
+        std::vector<int> ids;
+        // Step 1: split into words on whitespace and punctuation boundaries
+        std::vector<std::string> words;
+        std::string cur;
+        for (size_t i = 0; i < text.size(); i++) {
+            char c = text[i];
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                if (!cur.empty()) {
+                    words.push_back(cur);
+                    cur.clear();
+                }
+            } else if ((c >= '!' && c <= '/') || (c >= ':' && c <= '@') || (c >= '[' && c <= '`') ||
+                       (c >= '{' && c <= '~')) {
+                // Punctuation gets its own word
+                if (!cur.empty()) {
+                    words.push_back(cur);
+                    cur.clear();
+                }
+                words.push_back(std::string(1, c));
+            } else {
+                cur += c;
+            }
+        }
+        if (!cur.empty())
+            words.push_back(cur);
+
+        // Step 2: WordPiece each word
+        for (const auto& word : words) {
+            // Try whole word first
+            auto it = token_to_id.find(word);
+            if (it != token_to_id.end()) {
+                ids.push_back(it->second);
+                continue;
+            }
+            // Greedy longest-match from left
+            size_t start = 0;
+            bool failed = false;
+            while (start < word.size()) {
+                size_t end = word.size();
+                int best_id = -1;
+                while (end > start) {
+                    std::string sub = (start == 0) ? word.substr(0, end) : ("##" + word.substr(start, end - start));
+                    auto sit = token_to_id.find(sub);
+                    if (sit != token_to_id.end()) {
+                        best_id = sit->second;
+                        break;
+                    }
+                    // Don't split mid-UTF8
+                    end--;
+                    while (end > start && (word[end] & 0xC0) == 0x80)
+                        end--;
+                }
+                if (best_id < 0) {
+                    ids.push_back(unk_id);
+                    failed = true;
+                    break;
+                }
+                ids.push_back(best_id);
+                start = end;
+            }
+            (void)failed;
+        }
+        return ids;
+    }
+};
+
 // Pipeline-level constants
 struct bark_pipeline_params {
     uint32_t sample_rate = 24000;
@@ -196,6 +282,7 @@ struct bark_context {
     bark_encodec_model encodec;
 
     bark_speaker_prompt speaker;
+    bark_wordpiece_tokenizer tokenizer;
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
@@ -610,6 +697,12 @@ static float* run_gpt2_forward(bark_context* c, const bark_gpt_model& m, const b
 
 // Compute embeddings: token_embd[token_ids] + pos_embd[positions]
 // Returns (D, T) float array. Handles merge_context summing for text model.
+//
+// When merge_context=true, follows Bark's exact logic:
+//   1. Compute token embeddings only (no pos)
+//   2. Merge: tok_emb[0:256] += tok_emb[256:512], then append tok_emb[512:]
+//   3. Add position embeddings to the MERGED sequence (positions 0..new_T-1)
+// This ensures the INFER_TOKEN gets pos_embd[256], not pos_embd[512].
 static std::vector<float> compute_embeddings(bark_context* /*c*/, const bark_gpt_model& m, const bark_gpt_hp& hp,
                                              const std::vector<int32_t>& tokens, int pos_offset, bool merge_context,
                                              int merge_len) {
@@ -623,24 +716,17 @@ static std::vector<float> compute_embeddings(bark_context* /*c*/, const bark_gpt
     std::vector<float> result((size_t)D * T, 0.0f);
     std::vector<ggml_fp16_t> row_buf((size_t)D);
 
+    // Step 1: Compute token embeddings
     for (int t = 0; t < T; t++) {
         int tok = tokens[(size_t)t];
-        int pos = pos_offset + t;
-
-        // Token embedding
         ggml_backend_tensor_get(m.token_embd, row_buf.data(), (size_t)tok * embd_row, embd_row);
         for (int d = 0; d < D; d++) {
             result[(size_t)t * D + d] = ggml_fp16_to_fp32(row_buf[(size_t)d]);
         }
-
-        // Position embedding
-        ggml_backend_tensor_get(m.pos_embd, row_buf.data(), (size_t)pos * embd_row, embd_row);
-        for (int d = 0; d < D; d++) {
-            result[(size_t)t * D + d] += ggml_fp16_to_fp32(row_buf[(size_t)d]);
-        }
     }
 
-    // merge_context: sum embeddings[0:merge_len] += embeddings[merge_len:2*merge_len]
+    // Step 2: merge_context — sum token embeddings[0:merge_len] += [merge_len:2*merge_len]
+    int out_T = T;
     if (merge_context && merge_len > 0 && T >= 2 * merge_len) {
         for (int t = 0; t < merge_len; t++) {
             for (int d = 0; d < D; d++) {
@@ -648,11 +734,20 @@ static std::vector<float> compute_embeddings(bark_context* /*c*/, const bark_gpt
             }
         }
         // Remove the merged semantic history tokens (shift rest down)
-        int new_T = T - merge_len;
-        for (int t = merge_len; t < new_T; t++) {
+        out_T = T - merge_len;
+        for (int t = merge_len; t < out_T; t++) {
             std::memcpy(&result[(size_t)t * D], &result[(size_t)(t + merge_len) * D], (size_t)D * sizeof(float));
         }
-        result.resize((size_t)new_T * D);
+        result.resize((size_t)out_T * D);
+    }
+
+    // Step 3: Add position embeddings to the (possibly merged) sequence
+    for (int t = 0; t < out_T; t++) {
+        int pos = pos_offset + t;
+        ggml_backend_tensor_get(m.pos_embd, row_buf.data(), (size_t)pos * embd_row, embd_row);
+        for (int d = 0; d < D; d++) {
+            result[(size_t)t * D + d] += ggml_fp16_to_fp32(row_buf[(size_t)d]);
+        }
     }
 
     return result;
@@ -950,17 +1045,33 @@ static int sample_from_logits(const float* logits, int vocab_size, float tempera
 // Stage 1: Generate semantic tokens from text
 // ---------------------------------------------------------------------------
 
-// Simple tokenizer: maps text characters to token IDs offset by TEXT_ENCODING_OFFSET.
-// Bark's actual tokenizer is a BERT word-piece tokenizer. For a minimal implementation,
-// we use byte-level encoding: each byte -> byte_val + TEXT_ENCODING_OFFSET.
-// This is a functional approximation that produces valid tokens in the model's range.
-static std::vector<int32_t> tokenize_text_simple(const char* text, uint32_t text_encoding_offset,
-                                                 uint32_t text_pad_token, int max_len) {
+// Tokenize text using BERT WordPiece (cased), offset by TEXT_ENCODING_OFFSET,
+// then pad to max_len with text_pad_token.
+static std::vector<int32_t> tokenize_text_bert(bark_context* ctx, const char* text, uint32_t text_encoding_offset,
+                                               uint32_t text_pad_token, int max_len) {
     std::vector<int32_t> tokens;
-    const uint8_t* p = (const uint8_t*)text;
-    while (*p && (int)tokens.size() < max_len) {
-        tokens.push_back((int32_t)(*p) + (int32_t)text_encoding_offset);
-        p++;
+
+    if (ctx->tokenizer.loaded) {
+        // Use proper BERT WordPiece tokenization (add_special_tokens=False)
+        std::vector<int> bert_ids = ctx->tokenizer.tokenize(std::string(text));
+        for (int id : bert_ids) {
+            if ((int)tokens.size() >= max_len)
+                break;
+            tokens.push_back((int32_t)id + (int32_t)text_encoding_offset);
+        }
+    } else {
+        // Fallback: byte-level (should not happen if GGUF has vocab)
+        fprintf(stderr, "bark: WARNING - no BERT vocab loaded, using byte-level fallback\n");
+        const uint8_t* p = (const uint8_t*)text;
+        while (*p && (int)tokens.size() < max_len) {
+            tokens.push_back((int32_t)(*p) + (int32_t)text_encoding_offset);
+            p++;
+        }
+    }
+
+    // Truncate if too long
+    if ((int)tokens.size() > max_len) {
+        tokens.resize((size_t)max_len);
     }
     // Pad to max_len
     while ((int)tokens.size() < max_len) {
@@ -979,8 +1090,17 @@ static std::vector<int32_t> generate_text_semantic(bark_context* ctx, const char
         fprintf(stderr, "bark: stage 1 (semantic) - max_steps=%d\n", max_steps);
     }
 
-    // 1. Tokenize text -> padded to 256
-    std::vector<int32_t> text_tokens = tokenize_text_simple(text, pp.text_encoding_offset, pp.text_pad_token, ctx_len);
+    // 1. Tokenize text -> padded to 256 (BERT WordPiece, cased, + TEXT_ENCODING_OFFSET)
+    std::vector<int32_t> text_tokens =
+        tokenize_text_bert(ctx, text, pp.text_encoding_offset, pp.text_pad_token, ctx_len);
+
+    if (ctx->params.verbosity >= 2) {
+        fprintf(stderr, "bark: text tokens (first non-pad):");
+        for (int i = 0; i < ctx_len && text_tokens[(size_t)i] != (int32_t)pp.text_pad_token; i++) {
+            fprintf(stderr, " %d", text_tokens[(size_t)i]);
+        }
+        fprintf(stderr, "\n");
+    }
 
     // 2. Semantic history (from speaker or all-PAD)
     std::vector<int32_t> sem_hist(ctx_len, (int32_t)pp.semantic_pad_token);
@@ -1028,14 +1148,21 @@ static std::vector<int32_t> generate_text_semantic(bark_context* ctx, const char
     out.reserve((size_t)max_steps);
     float temperature = ctx->params.temperature_semantic;
 
-    // 7. AR decode
+    // 7. AR decode — sample from logits[0:10000] + logits[SEMANTIC_PAD_TOKEN] as EOS
+    // This matches Python: relevant_logits = hstack([logits[:10000], logits[10000]])
+    const int sample_vocab = (int)pp.semantic_vocab_size + 1; // 10001: 10000 semantic + 1 EOS
+    std::vector<float> sample_logits((size_t)sample_vocab);
+
     for (int step = 0; step < max_steps; step++) {
-        // Sample from logits[0:semantic_vocab_size]
-        int tok = sample_from_logits(logits, (int)pp.semantic_vocab_size, temperature, ctx->rng);
+        // Build sampling distribution: first 10000 logits + EOS logit (at index SEMANTIC_PAD_TOKEN)
+        std::memcpy(sample_logits.data(), logits, (size_t)pp.semantic_vocab_size * sizeof(float));
+        sample_logits[(size_t)pp.semantic_vocab_size] = logits[pp.semantic_pad_token];
+
+        int tok = sample_from_logits(sample_logits.data(), sample_vocab, temperature, ctx->rng);
         free(logits);
         logits = nullptr;
 
-        // Check EOS
+        // Check EOS (sampled index == 10000 means EOS token was selected)
         if (tok == (int)pp.semantic_vocab_size) {
             break;
         }
@@ -1095,11 +1222,11 @@ static std::vector<int32_t> generate_coarse(bark_context* ctx, const std::vector
     const int max_semantic_ctx = 256;
     (void)0; // sliding_window=60 used in full implementation
 
-    // Build semantic token sequence with padding
+    // Build semantic token sequence with RIGHT-side padding (tokens first, then pad)
     std::vector<int32_t> semantic_padded(max_semantic_ctx, (int32_t)pp.coarse_semantic_pad_token);
     int sem_len = std::min((int)semantic_tokens.size(), max_semantic_ctx);
     for (int i = 0; i < sem_len; i++) {
-        semantic_padded[(size_t)(max_semantic_ctx - sem_len + i)] = semantic_tokens[(size_t)i];
+        semantic_padded[(size_t)i] = semantic_tokens[(size_t)i];
     }
 
     // Coarse generation: slide through semantic tokens in windows
@@ -1596,10 +1723,20 @@ struct bark_context* bark_init_from_file(const char* path_model, struct bark_con
     ctx->buf_w = wl.buf;
     ctx->tensors = std::move(wl.tensors);
 
-    // Load metadata
+    // Load metadata + tokenizer vocab
     gguf_context* g = gguf_init_from_file(path_model, {/*.no_alloc=*/true, /*.ctx=*/nullptr});
     if (g) {
         load_metadata(ctx, g);
+        // Load BERT vocab from GGUF
+        ctx->tokenizer.id_to_token = core_gguf::kv_str_array(g, "tokenizer.ggml.tokens");
+        if (!ctx->tokenizer.id_to_token.empty()) {
+            ctx->tokenizer.build_map();
+            if (params.verbosity >= 1) {
+                fprintf(stderr, "bark: loaded BERT vocab (%d tokens)\n", (int)ctx->tokenizer.id_to_token.size());
+            }
+        } else {
+            fprintf(stderr, "bark: WARNING - no tokenizer vocab in GGUF, will use byte fallback\n");
+        }
         gguf_free(g);
     }
 
