@@ -45,6 +45,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_piper_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_outetts_backend();
 #endif
 std::unique_ptr<CrispasrBackend> crispasr_make_f5_tts_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_bark_backend();
 
 #include "ggml.h"
 #include "gguf.h"
@@ -148,6 +149,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_paraformer_backend();
     if (name == "sensevoice" || name == "sensevoice-small" || name == "sense-voice")
         return crispasr_make_sensevoice_backend();
+    if (name == "bark" || name == "bark-tts" || name == "bark-small" || name == "bark-large")
+        return crispasr_make_bark_backend();
 
     fprintf(stderr, "crispasr: error: unknown backend '%s'\n", name.c_str());
     return nullptr;
@@ -211,6 +214,8 @@ std::vector<std::string> crispasr_list_backends() {
         "fun-asr-mlt-nano",
         "paraformer",
         "sensevoice",
+        "bark",
+        "bark-tts",
     };
 }
 
