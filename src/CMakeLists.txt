@@ -1035,6 +1035,20 @@ if(NOT MSVC)
     target_compile_options(f5-tts PRIVATE -O3)
 endif()
 
+# ---------------------------------------------------------------------------
+# parler-tts — Parler TTS prompt-conditioned TTS (T5 + MusicGen decoder + DAC)
+# ---------------------------------------------------------------------------
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/parler_tts.cpp")
+add_library(parler-tts STATIC parler_tts.h parler_tts.cpp)
+set_target_properties(parler-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(parler-tts PUBLIC .)
+target_compile_features   (parler-tts PUBLIC cxx_std_17)
+target_link_libraries     (parler-tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(parler-tts PRIVATE -O3)
+endif()
+endif()
+
 # piper-tts — rhasspy/piper VITS TTS (native ggml runtime)
 # ---------------------------------------------------------------------------
 add_library(piper-tts STATIC piper_tts.h piper_tts.cpp)

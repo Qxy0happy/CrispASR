@@ -31,6 +31,7 @@ add_executable(${TARGET}
     crispasr_backend_chatterbox.cpp
     crispasr_backend_indextts.cpp
     crispasr_backend_f5_tts.cpp
+    crispasr_backend_parler.cpp
     crispasr_backend_voxcpm2_tts.cpp
     crispasr_backend_cosyvoice3.cpp
     crispasr_backend_kokoro.cpp
@@ -288,6 +289,11 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/crispasr_backend_outetts.cpp")
     target_sources(${TARGET} PRIVATE crispasr_backend_outetts.cpp)
     target_link_libraries(${TARGET} PRIVATE outetts)
     target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_OUTETTS=1)
+endif()
+
+# Optional parler-tts backend
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/crispasr_backend_parler.cpp")
+    target_link_libraries(${TARGET} PRIVATE parler-tts)
 endif()
 
 install(TARGETS ${TARGET} RUNTIME BUNDLE DESTINATION bin)
