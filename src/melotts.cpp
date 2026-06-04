@@ -1204,6 +1204,14 @@ static void transformer_coupling_forward(
     // Run transformer encoder layers
     std::vector<float> x = x_in;
 
+    // Determine FFN kernel size from weight shape
+    // ggml ne[0] = K for 3D conv weights
+    int ffn_k = 1;
+    if (fb.enc_layers.size() > 0 && fb.enc_layers[0].ffn_c1_w) {
+        ffn_k = (int)fb.enc_layers[0].ffn_c1_w->ne[0];
+    }
+    int ffn_pad = (ffn_k - 1) / 2; // same padding
+
     for (int il = 0; il < n_layers_tf; il++) {
         const auto & layer = fb.enc_layers[il];
 
@@ -1220,7 +1228,7 @@ static void transformer_coupling_forward(
         for (int i = 0; i < hidden * T; i++) x[i] += o[i];
         cpu_layer_norm(x, layer.norm1_g, layer.norm1_b, hidden, T);
 
-        // FFN
+        // FFN (kernel size may differ: text encoder uses k=3, flow uses k=5)
         {
             mini_graph mg(ctx->sched, 4 * 1024 * 1024);
             auto * gc = mg.ctx;
@@ -1230,9 +1238,9 @@ static void transformer_coupling_forward(
             ggml_set_input(x_t);
 
             ggml_tensor * ff = conv1d_cf(gc, x_t, layer.ffn_c1_w,
-                                         layer.ffn_c1_b, 1, 1, 1);
+                                         layer.ffn_c1_b, 1, ffn_pad, 1);
             ff = ggml_relu(gc, ff);
-            ff = conv1d_cf(gc, ff, layer.ffn_c2_w, layer.ffn_c2_b, 1, 1, 1);
+            ff = conv1d_cf(gc, ff, layer.ffn_c2_w, layer.ffn_c2_b, 1, ffn_pad, 1);
 
             ggml_cgraph * gf = ggml_new_graph_custom(gc, 1024, false);
             ggml_build_forward_expand(gf, ff);
@@ -1264,6 +1272,9 @@ static void flow_inverse(melotts_context * ctx,
 
     for (int fi = (int)ctx->w.flow_blocks.size() - 1; fi >= 0; fi--) {
         const auto & fb = ctx->w.flow_blocks[fi];
+
+        if (ctx->verbosity >= 2)
+            fprintf(stderr, "melotts: flow block %d (reverse)\n", fi);
 
         // Flip
         for (int t = 0; t < T; t++)
@@ -1362,11 +1373,12 @@ static bool hifigan_decode(melotts_context * ctx,
                                 w.dec_conv_pre_b, 1, 3, 1);
 
     // Speaker conditioning: x += cond(g)
+    // dec.cond is Conv1d(gin, upsample_initial_ch, 1) — 1x1 conv on (gin,1)
     if (g_input && w.dec_cond_w) {
-        ggml_tensor * g_proj = ggml_mul_mat(gc, w.dec_cond_w, g_input);
-        if (w.dec_cond_b) g_proj = ggml_add(gc, g_proj, w.dec_cond_b);
-        // g_proj is (upsample_initial_channel,) — broadcast add over T
-        g_proj = ggml_reshape_2d(gc, g_proj, (int64_t)hp.upsample_initial_channel, 1);
+        // Reshape g to (gin, 1) for conv1d_cf
+        ggml_tensor * g_2d = ggml_reshape_2d(gc, g_input, gin, 1);
+        ggml_tensor * g_proj = conv1d_cf(gc, g_2d, w.dec_cond_w, w.dec_cond_b);
+        // g_proj is (upsample_initial_channel, 1) — broadcast add over T
         x = ggml_add(gc, x, g_proj);
     }
 
@@ -1634,12 +1646,20 @@ static bool load_weights(melotts_context * ctx, const char * path) {
                     p++;
                 if (p >= cmudict_json.size() || cmudict_json[p] == '}') break;
 
-                // Parse key
+                // Parse key (with escape handling)
                 if (cmudict_json[p] != '"') break;
                 p++;
                 std::string word;
                 while (p < cmudict_json.size() && cmudict_json[p] != '"') {
-                    word += cmudict_json[p++];
+                    if (cmudict_json[p] == '\\' && p + 1 < cmudict_json.size()) {
+                        p++;
+                        if (cmudict_json[p] == '"') word += '"';
+                        else if (cmudict_json[p] == '\\') word += '\\';
+                        else word += cmudict_json[p];
+                    } else {
+                        word += cmudict_json[p];
+                    }
+                    p++;
                 }
                 if (p < cmudict_json.size()) p++; // skip "
 
@@ -1664,8 +1684,17 @@ static bool load_weights(melotts_context * ctx, const char * path) {
                         if (cmudict_json[p] == '"') {
                             p++;
                             std::string ph;
-                            while (p < cmudict_json.size() && cmudict_json[p] != '"')
-                                ph += cmudict_json[p++];
+                            while (p < cmudict_json.size() && cmudict_json[p] != '"') {
+                                if (cmudict_json[p] == '\\' && p + 1 < cmudict_json.size()) {
+                                    p++;
+                                    if (cmudict_json[p] == '"') ph += '"';
+                                    else if (cmudict_json[p] == '\\') ph += '\\';
+                                    else ph += cmudict_json[p];
+                                } else {
+                                    ph += cmudict_json[p];
+                                }
+                                p++;
+                            }
                             if (p < cmudict_json.size()) p++;
                             syl.push_back(ph);
                         } else break;

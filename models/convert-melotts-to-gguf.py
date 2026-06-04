@@ -31,9 +31,13 @@ except ImportError:
 
 
 def transpose_conv_weight(w: np.ndarray) -> np.ndarray:
-    """PyTorch Conv1d weight (Cout, Cin, K) -> ggml (K, Cin, Cout)."""
-    if w.ndim == 3:
-        return np.ascontiguousarray(w.transpose(2, 1, 0))
+    """No-op: GGUF reverses numpy dims automatically.
+
+    PyTorch Conv1d weight shape: (Cout, Cin, K)
+    Numpy stores as-is:          (Cout, Cin, K)
+    GGUF/ggml reverses to:       ne[0]=K, ne[1]=Cin, ne[2]=Cout
+    Which is exactly what ggml_conv_1d expects.
+    """
     return w
 
 
@@ -44,31 +48,34 @@ def fuse_weight_norm(sd: dict) -> dict:
         weight = v * (g / ||v||)
     where ||v|| is the L2 norm over all dims except dim 0 (output channels).
     """
-    fused = {}
+    # First pass: find all weight_norm pairs
     processed = set()
+    fused_weights = {}
 
-    for key in list(sd.keys()):
+    for key in sd.keys():
         if key.endswith(".weight_v"):
             base = key[: -len(".weight_v")]
             g_key = base + ".weight_g"
             if g_key in sd:
-                v = sd[key]  # (Cout, Cin, K) or (Cout, ...)
-                g = sd[g_key]  # (Cout, 1, 1) or (Cout, 1, ...)
-
-                # Compute L2 norm of v over all dims except 0
+                v = sd[key]
+                g = sd[g_key]
                 dims = tuple(range(1, v.ndim))
                 v_norm = torch.norm(v, dim=dims, keepdim=True)
                 weight = v * (g / (v_norm + 1e-12))
-
-                fused[base + ".weight"] = weight
+                fused_weights[base + ".weight"] = weight
                 processed.add(key)
                 processed.add(g_key)
-            else:
-                fused[key] = sd[key]
-        elif key not in processed:
-            fused[key] = sd[key]
 
-    return fused
+    # Second pass: build output, skip processed keys
+    result = {}
+    for key in sd.keys():
+        if key in processed:
+            continue
+        result[key] = sd[key]
+
+    # Add fused weights
+    result.update(fused_weights)
+    return result
 
 
 def main():
