@@ -1,6 +1,7 @@
 // crispasr_backend_melotts.cpp — MeloTTS (VITS2) backend adapter.
 
 #include "crispasr_backend.h"
+#include "crispasr_backend_utils.h"
 #include "melotts.h"
 
 #include <cstdlib>
@@ -25,14 +26,7 @@ public:
         if (p.seed > 0) mp.seed = (uint32_t)p.seed;
 
         ctx_ = melotts_init_from_file(p.model.c_str(), mp);
-        if (!ctx_) return false;
-
-        // Apply dump dir if set
-        if (!p.tts_dump_dir.empty()) {
-            melotts_set_dump_dir(ctx_, p.tts_dump_dir.c_str());
-        }
-
-        return true;
+        return ctx_ != nullptr;
     }
 
     std::vector<float> synthesize(const std::string & text,
@@ -58,7 +52,7 @@ public:
     }
 
     std::vector<crispasr_segment> transcribe(
-        const float *, int, const whisper_params &) override {
+        const float *, int, int64_t, const whisper_params &) override {
         return {}; // TTS-only
     }
 
