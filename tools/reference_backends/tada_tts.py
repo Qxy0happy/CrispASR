@@ -114,7 +114,13 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
         else:
             self._decoder = Decoder.from_pretrained("HumeAI/tada-codec", subfolder="decoder")
         # Load tokenizer from the model dir itself (has tokenizer.json)
-        self._tokenizer = AutoTokenizer.from_pretrained(str(path), use_fast=True)
+        # Load fast tokenizer directly from tokenizer.json — TADA dir has
+        # no tokenizer.model (sentencepiece), so AutoTokenizer's Llama slow
+        # path crashes. PreTrainedTokenizerFast bypasses the slow tokenizer.
+        from transformers import PreTrainedTokenizerFast
+        self._tokenizer = PreTrainedTokenizerFast(
+            tokenizer_file=str(Path(path) / "tokenizer.json")
+        )
         return self
 
     TadaForCausalLM.from_pretrained = _patched_from_pretrained
