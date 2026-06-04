@@ -57,6 +57,7 @@ void melotts_set_length_scale(struct melotts_context * ctx, float v);
 void melotts_set_noise_w(struct melotts_context * ctx, float v);
 void melotts_set_sdp_ratio(struct melotts_context * ctx, float v);
 void melotts_set_speaker_id(struct melotts_context * ctx, int id);
+void melotts_set_seed(struct melotts_context * ctx, uint32_t seed);
 
 // Query model info.
 int melotts_sample_rate(const struct melotts_context * ctx);

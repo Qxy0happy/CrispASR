@@ -107,6 +107,10 @@
 #include "piper_tts.h"
 #define CA_HAVE_PIPER 1
 #endif
+#if __has_include("melotts.h")
+#include "melotts.h"
+#define CA_HAVE_MELOTTS 1
+#endif
 #if __has_include("chatterbox.h")
 #include "chatterbox.h"
 #define CA_HAVE_CHATTERBOX 1
@@ -1383,6 +1387,9 @@ struct crispasr_session {
 #ifdef CA_HAVE_PIPER
     piper_tts_context* piper_ctx = nullptr;
 #endif
+#ifdef CA_HAVE_MELOTTS
+    melotts_context* melotts_ctx = nullptr;
+#endif
 #ifdef CA_HAVE_M2M100
     m2m100_context* m2m100_ctx = nullptr;
 #endif
@@ -2298,6 +2305,21 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_MELOTTS
+    if (s->backend == "melotts" || s->backend == "melo-tts" || s->backend == "melo") {
+        s->backend = "melotts";
+        melotts_params p = melotts_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        s->melotts_ctx = melotts_init_from_file(model_path, p);
+        if (!s->melotts_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
 #ifdef CA_HAVE_M2M100
     if (s->backend == "m2m100" || s->backend == "m2m-100" || s->backend == "translate" ||
         s->backend == "m2m100-wmt21") {
@@ -2599,6 +2621,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #endif
 #ifdef CA_HAVE_PIPER
     list += ",piper";
+#endif
+#ifdef CA_HAVE_MELOTTS
+    list += ",melotts";
 #endif
 #ifdef CA_HAVE_M2M100
     // m2m100-wmt21 routes through the same m2m100 engine (WMT21 Dense
@@ -5386,6 +5411,33 @@ CA_EXPORT float* crispasr_session_synthesize(crispasr_session* s, const char* te
         return dst;
     }
 #endif
+#ifdef CA_HAVE_MELOTTS
+    if (s->melotts_ctx) {
+        // MeloTTS synthesises at 44.1 kHz; resample to 24 kHz for session contract.
+        float* src = nullptr;
+        int sr = 0;
+        const int nIn = melotts_synthesize(s->melotts_ctx, text, &src, &sr);
+        if (!src || nIn <= 0) {
+            if (src) free(src);
+            return nullptr;
+        }
+        if (sr <= 0) sr = 44100;
+        const int64_t nOut = (int64_t)nIn * 24000 / sr;
+        float* dst = (float*)malloc((size_t)(nOut > 0 ? nOut : 1) * sizeof(float));
+        if (!dst) { free(src); return nullptr; }
+        const double ratio = (double)sr / 24000.0;
+        for (int64_t j = 0; j < nOut; ++j) {
+            const double pos = (double)j * ratio;
+            const int64_t i0 = (int64_t)pos;
+            const int64_t i1 = (i0 + 1 < nIn) ? i0 + 1 : nIn - 1;
+            const double frac = pos - (double)i0;
+            dst[j] = (float)((double)src[i0] * (1.0 - frac) + (double)src[i1] * frac);
+        }
+        melotts_pcm_free(src);
+        if (out_n_samples) *out_n_samples = (int)nOut;
+        return dst;
+    }
+#endif
     return nullptr;
 }
 
@@ -5679,6 +5731,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_PIPER
     if (s->piper_ctx)
         piper_tts_free(s->piper_ctx);
+#endif
+#ifdef CA_HAVE_MELOTTS
+    if (s->melotts_ctx)
+        melotts_free(s->melotts_ctx);
 #endif
 #ifdef CA_HAVE_M2M100
     if (s->m2m100_ctx)
@@ -6056,6 +6112,12 @@ CA_EXPORT int crispasr_session_set_tts_seed(crispasr_session* s, uint64_t seed) 
 #ifdef CA_HAVE_F5TTS
     if (s->f5tts_ctx) {
         f5_tts_set_seed(s->f5tts_ctx, seed);
+        touched++;
+    }
+#endif
+#ifdef CA_HAVE_MELOTTS
+    if (s->melotts_ctx) {
+        melotts_set_seed(s->melotts_ctx, (uint32_t)seed);
         touched++;
     }
 #endif

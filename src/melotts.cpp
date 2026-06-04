@@ -2104,6 +2104,7 @@ void melotts_set_length_scale(struct melotts_context * ctx, float v) { if (ctx) 
 void melotts_set_noise_w(struct melotts_context * ctx, float v) { if (ctx) ctx->noise_w = v; }
 void melotts_set_sdp_ratio(struct melotts_context * ctx, float v) { if (ctx) ctx->sdp_ratio = v; }
 void melotts_set_speaker_id(struct melotts_context * ctx, int id) { if (ctx) ctx->speaker_id = id; }
+void melotts_set_seed(struct melotts_context * ctx, uint32_t seed) { if (ctx) ctx->seed = seed; }
 int melotts_sample_rate(const struct melotts_context * ctx) { return ctx ? (int)ctx->hp.sample_rate : 44100; }
 int melotts_num_speakers(const struct melotts_context * ctx) { return ctx ? (int)ctx->hp.n_speakers : 1; }
 void melotts_set_dump_dir(struct melotts_context * ctx, const char * dir) {
