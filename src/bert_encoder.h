@@ -23,23 +23,19 @@ extern "C" {
 
 struct bert_encoder_context;
 
-struct bert_encoder_context * bert_encoder_init(const char * gguf_path,
-                                                int n_threads);
+struct bert_encoder_context* bert_encoder_init(const char* gguf_path, int n_threads);
 
-void bert_encoder_free(struct bert_encoder_context * ctx);
+void bert_encoder_free(struct bert_encoder_context* ctx);
 
 // Tokenize text and run BERT forward pass.
 // Returns the hidden states from layer -3 (layer 9 of 12).
 // out_features: (hidden_size=768, n_tokens) row-major, allocated by callee.
 // out_n_tokens: number of BERT tokens (including [CLS] and [SEP]).
 // Caller must free out_features with free().
-bool bert_encoder_forward(struct bert_encoder_context * ctx,
-                          const char * text,
-                          float ** out_features,
-                          int * out_n_tokens);
+bool bert_encoder_forward(struct bert_encoder_context* ctx, const char* text, float** out_features, int* out_n_tokens);
 
 // Get the hidden size (768 for bert-base-uncased).
-int bert_encoder_hidden_size(const struct bert_encoder_context * ctx);
+int bert_encoder_hidden_size(const struct bert_encoder_context* ctx);
 
 #ifdef __cplusplus
 }

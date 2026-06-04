@@ -16,6 +16,7 @@
 // data-dependent control flow into one monolithic graph.
 
 #include "melotts.h"
+#include "bert_encoder.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -729,6 +730,9 @@ struct melotts_context {
     melotts_weights w;
     melotts_g2p g2p;
 
+    // Optional BERT encoder for contextual conditioning
+    struct bert_encoder_context* bert_ctx = nullptr;
+
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_sched_t sched = nullptr;
@@ -985,10 +989,11 @@ static void cpu_layer_norm(std::vector<float>& x, ggml_tensor* g_t, ggml_tensor*
 
 // ── Text Encoder forward ──────────────────────────────────────────
 
+// ja_bert_features: (768, T) row-major, or empty for disable-bert mode
 static void text_encoder_forward(melotts_context* ctx, const std::vector<int>& phone_ids,
                                  const std::vector<int>& tone_ids, const std::vector<int>& lang_ids,
-                                 std::vector<float>& out_enc, std::vector<float>& out_mean,
-                                 std::vector<float>& out_logvar) {
+                                 const std::vector<float>& ja_bert_features, std::vector<float>& out_enc,
+                                 std::vector<float>& out_mean, std::vector<float>& out_logvar) {
     const auto& hp = ctx->hp;
     const auto& w = ctx->w;
     const int T = (int)phone_ids.size();
@@ -1045,25 +1050,43 @@ static void text_encoder_forward(melotts_context* ctx, const std::vector<int>& p
         }
     }
 
-    // Add BERT projection biases (even with zero BERT input, bias contributes)
-    // bert_proj: Conv1d(1024, hidden, 1) → bias shape (hidden,)
-    // ja_bert_proj: Conv1d(768, hidden, 1) → bias shape (hidden,)
-    // Both are applied to zero input, so output = bias, scaled by sqrt(C)
+    // BERT conditioning: project ja_bert features (768→192) + bert_proj bias
+    // For English: bert(1024) is always zeros, so only bias contributes.
+    // ja_bert(768) has actual features when BERT model is loaded.
     {
-        std::vector<float> bp_bias, jbp_bias;
+        std::vector<float> bp_bias;
         if (w.bert_proj_b)
             read_tensor_f32(w.bert_proj_b, bp_bias);
-        if (w.ja_bert_proj_b)
-            read_tensor_f32(w.ja_bert_proj_b, jbp_bias);
-        for (int t = 0; t < T; t++) {
-            for (int c = 0; c < C; c++) {
-                float b = 0;
-                if (c < (int)bp_bias.size())
-                    b += bp_bias[c];
-                if (c < (int)jbp_bias.size())
-                    b += jbp_bias[c];
-                x[t * C + c] += b * sqrt_c;
+
+        // bert_proj bias (1024-dim input is zero, only bias matters)
+        for (int t = 0; t < T; t++)
+            for (int c = 0; c < C && c < (int)bp_bias.size(); c++)
+                x[t * C + c] += bp_bias[c] * sqrt_c;
+
+        // ja_bert_proj: Conv1d(768, hidden, 1) applied to ja_bert features
+        if (!ja_bert_features.empty() && w.ja_bert_proj_w && w.ja_bert_proj_b) {
+            // ja_bert_features is (768, T) row-major = [c * T + t]
+            // ja_bert_proj is Conv1d(768, 192, 1) — 1x1 conv = linear
+            std::vector<float> jbp_w, jbp_b;
+            read_tensor_f32(w.ja_bert_proj_w, jbp_w);
+            read_tensor_f32(w.ja_bert_proj_b, jbp_b);
+            int bert_dim = 768;
+            for (int t = 0; t < T; t++) {
+                for (int oc = 0; oc < C; oc++) {
+                    float sum = jbp_b[oc];
+                    for (int ic = 0; ic < bert_dim; ic++)
+                        sum += ja_bert_features[ic * T + t] * jbp_w[ic + oc * bert_dim];
+                    x[t * C + oc] += sum * sqrt_c;
+                }
             }
+        } else {
+            // No BERT features — just add ja_bert_proj bias
+            std::vector<float> jbp_bias;
+            if (w.ja_bert_proj_b)
+                read_tensor_f32(w.ja_bert_proj_b, jbp_bias);
+            for (int t = 0; t < T; t++)
+                for (int c = 0; c < C && c < (int)jbp_bias.size(); c++)
+                    x[t * C + c] += jbp_bias[c] * sqrt_c;
         }
     }
 
@@ -2367,9 +2390,28 @@ struct melotts_context* melotts_init_from_file(const char* path_model, struct me
     return ctx;
 }
 
+bool melotts_load_bert(struct melotts_context* ctx, const char* bert_gguf_path) {
+    if (!ctx || !bert_gguf_path)
+        return false;
+    if (ctx->bert_ctx) {
+        bert_encoder_free(ctx->bert_ctx);
+        ctx->bert_ctx = nullptr;
+    }
+    ctx->bert_ctx = bert_encoder_init(bert_gguf_path, ctx->n_threads);
+    if (!ctx->bert_ctx) {
+        fprintf(stderr, "melotts: failed to load BERT model '%s'\n", bert_gguf_path);
+        return false;
+    }
+    if (ctx->verbosity >= 1)
+        fprintf(stderr, "melotts: BERT conditioning enabled (%s)\n", bert_gguf_path);
+    return true;
+}
+
 void melotts_free(struct melotts_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->bert_ctx)
+        bert_encoder_free(ctx->bert_ctx);
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
     if (ctx->w_buf)
@@ -2418,9 +2460,43 @@ int melotts_synthesize(struct melotts_context* ctx, const char* text, float** pc
     }
     dump_stage(ctx, "speaker_emb", g_vec.data(), g_vec.size());
 
-    // 3. Text encoder
+    // 3. BERT conditioning (if loaded)
+    std::vector<float> ja_bert_features;
+    if (ctx->bert_ctx) {
+        float* bert_out = nullptr;
+        int n_bert_tokens = 0;
+        if (bert_encoder_forward(ctx->bert_ctx, text, &bert_out, &n_bert_tokens)) {
+            int bert_dim = bert_encoder_hidden_size(ctx->bert_ctx);
+            // bert_out is (n_bert_tokens, bert_dim) row-major
+            // We need (bert_dim, T) where T is the phone sequence length
+            // Simple word2ph approximation: distribute BERT tokens evenly
+            // across phonemes (excluding interspersed blanks)
+            // n_bert_tokens includes [CLS] and [SEP]
+            int n_content_tokens = n_bert_tokens - 2; // exclude [CLS] [SEP]
+            if (n_content_tokens > 0) {
+                ja_bert_features.resize(bert_dim * T, 0.0f);
+                // Map each phone position to a BERT token
+                // Blanks (even positions after intersperse) get the nearest token
+                for (int t = 0; t < T; t++) {
+                    // Position in the original phone sequence (before intersperse)
+                    // Odd positions are real phones, even are blanks
+                    int phone_pos = t / 2; // approximate
+                    // Map phone_pos to BERT token (skip [CLS])
+                    int bert_tok = 1 + (phone_pos * n_content_tokens) / std::max(1, (T + 1) / 2);
+                    bert_tok = std::clamp(bert_tok, 1, n_bert_tokens - 2);
+                    for (int c = 0; c < bert_dim; c++)
+                        ja_bert_features[c * T + t] = bert_out[bert_tok * bert_dim + c];
+                }
+            }
+            free(bert_out);
+            if (ctx->verbosity >= 2)
+                fprintf(stderr, "melotts: BERT %d tokens → %d phones (dim=%d)\n", n_bert_tokens, T, bert_dim);
+        }
+    }
+
+    // 4. Text encoder
     std::vector<float> enc_out, enc_mean, enc_logvar;
-    text_encoder_forward(ctx, phone_ids, tone_ids, lang_ids, enc_out, enc_mean, enc_logvar);
+    text_encoder_forward(ctx, phone_ids, tone_ids, lang_ids, ja_bert_features, enc_out, enc_mean, enc_logvar);
 
     int C = (int)ctx->hp.inter_channels;
     if (enc_mean.empty()) {

@@ -39,6 +39,11 @@ struct melotts_context* melotts_init_from_file(const char* path_model, struct me
 
 void melotts_free(struct melotts_context* ctx);
 
+// Load a companion BERT model for contextual conditioning.
+// If loaded, synthesize() produces higher quality output.
+// path: GGUF from convert-bert-base-to-gguf.py (~238 MB).
+bool melotts_load_bert(struct melotts_context* ctx, const char* bert_gguf_path);
+
 // Synthesize text to mono PCM at 44100 Hz.
 // Returns number of samples, 0 on failure.
 // *pcm_out is malloc'd by this function; caller frees with free().
