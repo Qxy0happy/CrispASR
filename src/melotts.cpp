@@ -292,6 +292,8 @@ struct melotts_flow_coupling {
     // TransformerCouplingLayer: pre -> encoder(3-layer transformer) -> post
     ggml_tensor * pre_w, * pre_b;
     ggml_tensor * post_w, * post_b;
+    // Speaker conditioning in flow encoder
+    ggml_tensor * spk_emb_linear_w, * spk_emb_linear_b;
     // Encoder layers (n_layers_trans_flow)
     std::vector<melotts_enc_layer> enc_layers;
 };
@@ -1218,7 +1220,7 @@ static void transformer_coupling_forward(
     melotts_context * ctx,
     const melotts_flow_coupling & fb,
     const std::vector<float> & x_in, // (hidden, T) after pre conv
-    const std::vector<float> & /*g_vec*/, // (gin,) speaker (reserved for future use)
+    const std::vector<float> & g_vec, // (gin,) speaker
     int hidden, int T, int n_layers_tf,
     std::vector<float> & out)
 {
@@ -1229,6 +1231,24 @@ static void transformer_coupling_forward(
 
     // Run transformer encoder layers
     std::vector<float> x = x_in;
+    int gin = (int)ctx->hp.gin_channels;
+
+    // Compute speaker conditioning for this flow block's encoder
+    std::vector<float> spk_cond_flow;
+    if (fb.spk_emb_linear_w && !g_vec.empty()) {
+        std::vector<float> slw, slb;
+        read_tensor_f32(fb.spk_emb_linear_w, slw);
+        read_tensor_f32(fb.spk_emb_linear_b, slb);
+        spk_cond_flow.resize(hidden);
+        for (int co = 0; co < hidden; co++) {
+            float s = slb[co];
+            for (int ci = 0; ci < gin; ci++)
+                s += g_vec[ci] * slw[ci + co * gin];
+            spk_cond_flow[co] = s;
+        }
+    }
+
+    int cond_layer_idx = 2; // MeloTTS flow encoder also injects at layer 2
 
     // Determine FFN kernel size from weight shape
     // ggml ne[0] = K for 3D conv weights
@@ -1241,11 +1261,18 @@ static void transformer_coupling_forward(
     for (int il = 0; il < n_layers_tf; il++) {
         const auto & layer = fb.enc_layers[il];
 
+        // Speaker conditioning at cond_layer_idx
+        if (il == cond_layer_idx && !spk_cond_flow.empty()) {
+            for (int t = 0; t < T; t++)
+                for (int c = 0; c < hidden; c++)
+                    x[t * hidden + c] += spk_cond_flow[c];
+        }
+
         // Attention
         std::vector<float> attn_out;
         cpu_multihead_attention_relpos(
             x, layer, hidden, T, H, D, W,
-            nullptr, 0, -1, il, // no speaker injection in flow encoder
+            nullptr, 0, -1, il,
             attn_out);
 
         std::vector<float> o;
@@ -1831,6 +1858,10 @@ static bool load_weights(melotts_context * ctx, const char * path) {
         fb.pre_b  = require_tensor(tensors, p + ".pre.bias");
         fb.post_w = require_tensor(tensors, p + ".post.weight");
         fb.post_b = require_tensor(tensors, p + ".post.bias");
+
+        // Speaker conditioning in flow encoder
+        fb.spk_emb_linear_w = try_tensor(tensors, p + ".enc.spk_emb_linear.weight");
+        fb.spk_emb_linear_b = try_tensor(tensors, p + ".enc.spk_emb_linear.bias");
 
         // Encoder layers within this coupling block
         fb.enc_layers.resize(hp.n_layers_trans_flow);
