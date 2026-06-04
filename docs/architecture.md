@@ -609,6 +609,17 @@ relative-position bias) + SentencePiece (256K vocab). Target language
 specified as `<2xx>` input prefix. Tokens match Python SentencePiece
 bit-by-bit; output matches HF reference.
 
+### melotts
+
+[myshell-ai/MeloTTS](https://github.com/myshell-ai/MeloTTS) VITS2
+architecture (~52M params, MIT). Text encoder (6-layer relative-position
+transformer with speaker conditioning at layer 2) → dual duration predictor
+(SDP spline flows + deterministic DP, blended via sdp_ratio) →
+TransformerCouplingBlock flow (4 blocks × 3 transformer layers) → HiFi-GAN
+vocoder (5 upsample stages) @ 44.1 kHz. Built-in English G2P via embedded
+CMU dictionary (129k entries). 4 English speakers (US, BR, India, AU).
+Currently runs in disable-BERT mode (zero BERT embeddings + bias terms).
+
 ### piper
 
 [rhasspy/piper](https://github.com/rhasspy/piper) VITS architecture (~60M
