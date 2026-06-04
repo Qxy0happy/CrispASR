@@ -269,17 +269,18 @@ static bool kv_init(tada_context* c, int max_ctx) {
     const int nl = (int)hp.n_layers;
     const int hd = (int)hp.head_dim;
     const int nkv = (int)hp.n_kv_heads;
-    const size_t kv_size = (size_t)nl * hd * nkv * max_ctx;
 
-    ggml_type kv_type = GGML_TYPE_F16;
+    const auto kv_pair = core_attn::kv_dtype_pair_from_env("tada");
     ggml_init_params ip = {
         ggml_tensor_overhead() * 2,
         nullptr,
         true
     };
     c->kv_ctx = ggml_init(ip);
-    c->kv_k = ggml_new_tensor_1d(c->kv_ctx, kv_type, kv_size);
-    c->kv_v = ggml_new_tensor_1d(c->kv_ctx, kv_type, kv_size);
+    c->kv_k = ggml_new_tensor_4d(c->kv_ctx, kv_pair.k, hd, max_ctx, nkv, nl);
+    c->kv_v = ggml_new_tensor_4d(c->kv_ctx, kv_pair.v, hd, max_ctx, nkv, nl);
+    ggml_set_name(c->kv_k, "kv_k");
+    ggml_set_name(c->kv_v, "kv_v");
     c->kv_buf = ggml_backend_alloc_ctx_tensors(c->kv_ctx, c->backend);
     if (!c->kv_buf) {
         fprintf(stderr, "tada: failed to allocate KV cache (%d ctx)\n", max_ctx);

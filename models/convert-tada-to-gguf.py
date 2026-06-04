@@ -122,6 +122,11 @@ def map_tensor_name(hf_name: str) -> str | None:
     n = n.replace("prediction_head.t_embedder.mlp.0.", "tada.fm_head.t_emb_mlp0.")
     n = n.replace("prediction_head.t_embedder.mlp.2.", "tada.fm_head.t_emb_mlp1.")
 
+    # FM final layer — MUST come before generic .adaLN_modulation.1. rule
+    n = n.replace("prediction_head.final_layer.norm_final.", "tada.fm_head.final_norm.")
+    n = n.replace("prediction_head.final_layer.linear.", "tada.fm_head.final_proj.")
+    n = n.replace("prediction_head.final_layer.adaLN_modulation.1.", "tada.fm_head.final_adaln.")
+
     # FM head layers: prediction_head.layers.{i}.* → tada.fm_head.blk.{i}.*
     n = n.replace("prediction_head.layers.", "tada.fm_head.blk.")
     n = n.replace(".ffn.gate_proj.", ".ffn_gate.")
@@ -129,11 +134,6 @@ def map_tensor_name(hf_name: str) -> str | None:
     n = n.replace(".ffn.down_proj.", ".ffn_down.")
     n = n.replace(".norm.", ".norm.")
     n = n.replace(".adaLN_modulation.1.", ".adaln.")
-
-    # FM final layer
-    n = n.replace("prediction_head.final_layer.norm_final.", "tada.fm_head.final_norm.")
-    n = n.replace("prediction_head.final_layer.linear.", "tada.fm_head.final_proj.")
-    n = n.replace("prediction_head.final_layer.adaLN_modulation.1.", "tada.fm_head.final_adaln.")
 
     return n
 
