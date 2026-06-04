@@ -831,6 +831,18 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# tada-tts — HumeAI/tada-3b-ml (Llama-3.2-3B + FM head + TADA codec)
+# ---------------------------------------------------------------------------
+add_library(tada-tts STATIC tada_tts.h tada_tts.cpp)
+set_target_properties(tada-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(tada-tts PUBLIC .)
+target_compile_features   (tada-tts PUBLIC cxx_std_17)
+target_link_libraries     (tada-tts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(tada-tts PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
 # indextts — IndexTeam/IndexTTS-1.5 (GPT-2 AR + BigVGAN vocoder)
 # ---------------------------------------------------------------------------
 add_library(indextts STATIC indextts.h indextts.cpp indextts_voc.h indextts_voc.cpp)

@@ -179,6 +179,10 @@
 #include "orpheus.h"
 #define CA_HAVE_ORPHEUS 1
 #endif
+#if __has_include("tada_tts.h")
+#include "tada_tts.h"
+#define CA_HAVE_TADA 1
+#endif
 #if __has_include("mimo_asr.h")
 #include "mimo_asr.h"
 #define CA_HAVE_MIMO_ASR 1
@@ -1332,6 +1336,9 @@ struct crispasr_session {
 #ifdef CA_HAVE_ORPHEUS
     orpheus_context* orpheus_ctx = nullptr;
     bool orpheus_codec_loaded = false;
+#endif
+#ifdef CA_HAVE_TADA
+    tada_context* tada_ctx = nullptr;
 #endif
 #ifdef CA_HAVE_KOKORO
     kokoro_context* kokoro_ctx = nullptr;

@@ -29,6 +29,7 @@ add_executable(${TARGET}
     crispasr_backend_qwen3_tts.cpp
     crispasr_backend_orpheus.cpp
     crispasr_backend_chatterbox.cpp
+    crispasr_backend_tada.cpp
     crispasr_backend_indextts.cpp
     crispasr_backend_f5_tts.cpp
     crispasr_backend_pocket_tts.cpp
@@ -175,6 +176,7 @@ target_link_libraries(crispasr-diff PRIVATE
     orpheus
     kokoro
     chatterbox
+    tada-tts
     indextts
     m2m100
     gemma4_e2b
@@ -261,6 +263,7 @@ target_link_libraries(${TARGET} PRIVATE
     qwen3_tts
     orpheus
     chatterbox
+    tada-tts
     indextts
     kokoro
     piper-tts

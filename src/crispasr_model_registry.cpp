@@ -401,6 +401,12 @@ constexpr Entry k_registry[] = {
      "~3.5 GB",
      "snac-24khz.gguf",
      "https://huggingface.co/cstr/snac-24khz-GGUF/resolve/main/snac-24khz.gguf"},
+    // TADA-3B-ML (HumeAI/tada-3b-ml): Llama-3.2-3B + flow matching + TADA codec.
+    {"tada", "tada-tts-3b-ml-f16.gguf",
+     "https://huggingface.co/cstr/tada-tts-3b-ml-GGUF/resolve/main/tada-tts-3b-ml-f16.gguf",
+     "~6.6 GB",
+     "tada-codec-f16.gguf",
+     "https://huggingface.co/cstr/tada-tts-3b-ml-GGUF/resolve/main/tada-codec-f16.gguf"},
     // lex-au's German Orpheus-3B fine-tune. Already published as a Q8_0
     // GGUF on HF (`lex-au/Orpheus-3b-German-FT-Q8_0.gguf`, 3.52 GB) — the
     // repo name itself ends in `.gguf`, lex-au's convention. License
