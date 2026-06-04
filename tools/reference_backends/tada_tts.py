@@ -98,48 +98,32 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
     from tada.modules.encoder import EncoderOutput
     from tada.utils.gray_code import decode_gray_code_to_time
 
-    # Monkey-patch from_pretrained to use the local tokenizer.json
-    # (avoids gated-repo 401 on meta-llama/Llama-3.2-1B)
-    _orig_from_pretrained = TadaForCausalLM.from_pretrained.__func__
+    # Monkey-patch AutoTokenizer.from_pretrained to handle the gated
+    # Llama-3.2-1B tokenizer by falling back to the unsloth mirror.
+    _orig_auto_tok = AutoTokenizer.from_pretrained.__func__
 
     @classmethod
-    def _patched_from_pretrained(cls, path, *args, **kwargs):
-        self = LlamaForCausalLM.from_pretrained(path, *args, **kwargs)
-        self.__class__ = cls
-        cls.__init__(self, self.config)
-        # Load decoder from codec dir if available, else from HF
-        codec_dir = os.environ.get("TADA_CODEC_DIR")
-        if codec_dir:
-            self._decoder = Decoder.from_pretrained(codec_dir, subfolder="decoder")
-        else:
-            self._decoder = Decoder.from_pretrained("HumeAI/tada-codec", subfolder="decoder")
-        # TADA's tokenizer comes from meta-llama/Llama-3.2-1B (gated repo).
-        # The model dir has NO tokenizer files. Try loading with HF token;
-        # fall back to downloading tokenizer.json from the hume-tada package
-        # data or from a non-gated mirror.
-        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-        tokenizer_name = getattr(self.config, "tokenizer_name", "meta-llama/Llama-3.2-1B")
+    def _patched_auto_tok(cls, name_or_path, *args, **kwargs):
         try:
-            self._tokenizer = AutoTokenizer.from_pretrained(
-                tokenizer_name, token=hf_token, use_fast=True
-            )
+            return _orig_auto_tok(cls, name_or_path, *args, **kwargs)
         except Exception as e:
-            print(f"  WARN: failed to load tokenizer from {tokenizer_name}: {e}")
-            print(f"  Falling back to GPT2TokenizerFast as a Llama-3.2 compatible tokenizer")
-            # Llama-3.2 uses a BPE tokenizer with 128256 vocab. As a fallback,
-            # try loading from the unsloth mirror (public, Llama-compatible).
-            try:
-                self._tokenizer = AutoTokenizer.from_pretrained(
-                    "unsloth/Llama-3.2-1B", use_fast=True
-                )
-            except Exception:
-                raise RuntimeError(
-                    f"Cannot load tokenizer for TADA. Set HF_TOKEN env var "
-                    f"and accept the Llama license at huggingface.co/meta-llama/Llama-3.2-1B"
-                ) from e
-        return self
+            if "gated" in str(e).lower() or "401" in str(e):
+                print(f"  WARN: gated repo {name_or_path}, trying unsloth mirror")
+                return _orig_auto_tok(cls, "unsloth/Llama-3.2-1B", *args, **kwargs)
+            raise
 
-    TadaForCausalLM.from_pretrained = _patched_from_pretrained
+    AutoTokenizer.from_pretrained = _patched_auto_tok
+
+    # Also patch the codec loading to use local dir if available
+    codec_dir = os.environ.get("TADA_CODEC_DIR")
+    if codec_dir:
+        _orig_decoder_from = Decoder.from_pretrained.__func__
+        @classmethod
+        def _patched_decoder(cls, name, *a, **kw):
+            if "tada-codec" in str(name):
+                return _orig_decoder_from(cls, codec_dir, *a, **kw)
+            return _orig_decoder_from(cls, name, *a, **kw)
+        Decoder.from_pretrained = _patched_decoder
 
     model = TadaForCausalLM.from_pretrained(
         str(model_dir), torch_dtype=torch.bfloat16
