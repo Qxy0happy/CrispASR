@@ -456,7 +456,7 @@ static ggml_cgraph* build_graph_fm_step(tada_context* c) {
     const auto& hp = c->hp;
     const int hid = (int)hp.fm_hidden;
     const int lat = (int)hp.fm_latent;
-    const int ffn_dim = (int)hp.fm_ffn_dim();
+    (void)hp; // fm_ffn_dim used implicitly via layer weights
     const float eps = hp.rms_norm_eps;
 
     ggml_init_params ip = {c->compute_meta.size(), c->compute_meta.data(), true};
@@ -731,7 +731,7 @@ static void run_fm_step(tada_context* c, const float* noisy_z, float timestep,
 
 // Euler ODE solver for flow matching.
 static void fm_euler_solve(tada_context* c, float* speech, const float* cond,
-                            int num_steps, float cfg_scale) {
+                            int num_steps, float /*cfg_scale*/) {
     const int lat = (int)c->hp.fm_latent;
 
     // Uniform time schedule [0, 1]
@@ -766,7 +766,7 @@ static int argmax_logits(const float* logits, int n) {
 
 // BPE tokenize text using Llama tokenizer.
 static std::vector<int32_t> tokenize(tada_context* c, const std::string& text) {
-    return core_bpe::encode(text, c->vocab.token_to_id, c->vocab.merge_rank);
+    return core_bpe::tokenize_simple(c->vocab.token_to_id, c->vocab.merge_rank, text);
 }
 
 // ──────────────────────── public API ─────────────────────────────────
@@ -774,18 +774,18 @@ static std::vector<int32_t> tokenize(tada_context* c, const std::string& text) {
 extern "C" {
 
 struct tada_context_params tada_context_default_params(void) {
-    return {
-        /*.n_threads    =*/ 4,
-        /*.verbosity    =*/ 1,
-        /*.use_gpu      =*/ false,
-        /*.temperature  =*/ 0.0f,
-        /*.seed         =*/ 42,
-        /*.max_tokens   =*/ 0,
-        /*.flash_attn   =*/ false,
-        /*.num_fm_steps =*/ 0,
-        /*.acoustic_cfg =*/ 1.0f,
-        /*.noise_temp   =*/ 0.0f,
-    };
+    tada_context_params p = {};
+    p.n_threads    = 4;
+    p.verbosity    = 1;
+    p.use_gpu      = false;
+    p.temperature  = 0.0f;
+    p.seed         = 42;
+    p.max_tokens   = 0;
+    p.flash_attn   = false;
+    p.num_fm_steps = 0;
+    p.acoustic_cfg = 1.0f;
+    p.noise_temp   = 0.0f;
+    return p;
 }
 
 struct tada_context* tada_init_from_file(const char* path_model,
@@ -818,7 +818,7 @@ struct tada_context* tada_init_from_file(const char* path_model,
 
     // ── Pass 2: weights ──
     core_gguf::WeightLoad wl;
-    if (!core_gguf::load_weights(path_model, c->backend, wl)) {
+    if (!core_gguf::load_weights(path_model, c->backend, "tada", wl)) {
         fprintf(stderr, "tada: failed to load weights from %s\n", path_model);
         delete c;
         return nullptr;
@@ -871,7 +871,6 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
     *out_n_samples = 0;
 
     const auto& hp = ctx->hp;
-    const int d = (int)hp.d_model;
     const int ad = (int)hp.acoustic_dim;
     const int lat = (int)hp.fm_latent;
     const int shift = (int)hp.shift_acoustic;
