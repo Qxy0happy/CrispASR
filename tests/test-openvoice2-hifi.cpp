@@ -88,6 +88,40 @@ int main(int argc, char** argv) {
             openvoice2_free(ctx);
             return 1;
         }
+
+        // Write WAV for ASR roundtrip
+        {
+            const char* wav_out = "/tmp/ov2-hifi-test.wav";
+            FILE* wf = fopen(wav_out, "wb");
+            if (wf) {
+                int16_t* pcm16 = (int16_t*)malloc(n_out * 2);
+                for (int i = 0; i < n_out; i++) {
+                    float v = out[i] * 32767.0f;
+                    if (v > 32767.0f) v = 32767.0f;
+                    if (v < -32768.0f) v = -32768.0f;
+                    pcm16[i] = (int16_t)v;
+                }
+                uint32_t data_size = n_out * 2;
+                uint32_t riff_size = 36 + data_size;
+                fwrite("RIFF", 1, 4, wf);
+                fwrite(&riff_size, 4, 1, wf);
+                fwrite("WAVE", 1, 4, wf);
+                fwrite("fmt ", 1, 4, wf);
+                uint32_t fmt_size = 16; fwrite(&fmt_size, 4, 1, wf);
+                uint16_t audio_fmt = 1; fwrite(&audio_fmt, 2, 1, wf);
+                uint16_t channels = 1; fwrite(&channels, 2, 1, wf);
+                uint32_t sr_out = 22050; fwrite(&sr_out, 4, 1, wf);
+                uint32_t byte_rate = 44100; fwrite(&byte_rate, 4, 1, wf);
+                uint16_t block_align = 2; fwrite(&block_align, 2, 1, wf);
+                uint16_t bps = 16; fwrite(&bps, 2, 1, wf);
+                fwrite("data", 1, 4, wf);
+                fwrite(&data_size, 4, 1, wf);
+                fwrite(pcm16, 2, n_out, wf);
+                fclose(wf);
+                free(pcm16);
+                fprintf(stderr, "Wrote %s\n", wav_out);
+            }
+        }
         free(out);
     } else {
         fprintf(stderr, "FAIL: openvoice2_convert returned false\n");
