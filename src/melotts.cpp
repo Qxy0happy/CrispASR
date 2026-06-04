@@ -778,12 +778,6 @@ static void text_encoder_forward(
             cpu_layer_norm(x, layer.norm2_g, layer.norm2_b, C, T);
         }
 
-        // Dump each layer output for debugging
-        {
-            char label[64];
-            snprintf(label, sizeof(label), "enc_layer_%u", il);
-            dump_stage(ctx, label, x.data(), x.size());
-        }
     }
 
     out_enc = x;
@@ -973,7 +967,7 @@ static float rqs_inverse(float y_in, const float * w_bins,
 // ── SDP ConvFlow inverse ──────────────────────────────────────────
 
 static void sdp_convflow_inverse(
-    melotts_context * ctx, const melotts_sdp_convflow & cf,
+    melotts_context * /*ctx*/, const melotts_sdp_convflow & cf,
     std::vector<float> & z, // (2, T)
     const std::vector<float> & h, // (C, T)
     int C, int T, int num_bins)
@@ -1141,7 +1135,7 @@ static void dp_forward(melotts_context * ctx,
     const auto & hp = ctx->hp;
     const auto & w  = ctx->w;
     int C = (int)hp.hidden_channels;
-    int FC = 256; // filter_channels for DP
+    (void)hp; // DP filter_channels inferred from weights
     int gin = (int)hp.gin_channels;
 
     // Add speaker conditioning: dp.cond(g)
@@ -1224,7 +1218,7 @@ static void transformer_coupling_forward(
     melotts_context * ctx,
     const melotts_flow_coupling & fb,
     const std::vector<float> & x_in, // (hidden, T) after pre conv
-    const std::vector<float> & g_vec, // (gin,) speaker
+    const std::vector<float> & /*g_vec*/, // (gin,) speaker (reserved for future use)
     int hidden, int T, int n_layers_tf,
     std::vector<float> & out)
 {
@@ -1972,15 +1966,6 @@ int melotts_synthesize(struct melotts_context * ctx, const char * text,
 
     if (ctx->verbosity >= 2) {
         fprintf(stderr, "melotts: %d phoneme IDs (after intersperse)\n", T);
-    }
-
-    // Dump input IDs
-    {
-        std::vector<float> pid_f(T), tid_f(T), lid_f(T);
-        for (int i = 0; i < T; i++) { pid_f[i] = (float)phone_ids[i]; tid_f[i] = (float)tone_ids[i]; lid_f[i] = (float)lang_ids[i]; }
-        dump_stage(ctx, "phoneme_ids_cpp", pid_f.data(), T);
-        dump_stage(ctx, "tone_ids_cpp", tid_f.data(), T);
-        dump_stage(ctx, "lang_ids_cpp", lid_f.data(), T);
     }
 
     // 2. Speaker embedding
