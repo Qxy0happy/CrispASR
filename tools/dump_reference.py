@@ -230,6 +230,10 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # Audio arg unused (text-driven). Text from PARLER_TEXT / PARLER_DESC
     # env vars. See reference_backends/parler_tts.py for the full list.
     "parler-tts": "reference_backends.parler_tts",
+    # TADA-3B-ML TTS: Llama-3.2-3B + per-token flow matching + TADA codec.
+    # model_dir = HumeAI/tada-3b-ml HF id or local snapshot.
+    # Audio arg is unused (text-driven). Text from TADA_SYN_TEXT env var.
+    "tada-tts":   "reference_backends.tada_tts",
 }
 
 DEFAULT_STAGES_BY_BACKEND: Dict[str, List[str]] = {}  # populated at import
