@@ -204,18 +204,18 @@ static void g2p_english(const melotts_g2p & g2p, const std::string & text,
     // Trailing pad
     add_phone("_", 0);
 
-    // Intersperse with blanks (symbol 0 = "_" = pad)
+    // Intersperse with blanks: [0, e0, 0, e1, 0, ..., eN, 0]
+    // Matches Python: result = [item] * (len*2+1); result[1::2] = lst
+    // Blank positions get phone=0, tone=0, lang=0
     {
-        std::vector<int> p2, t2, l2;
-        for (size_t i = 0; i < phone_ids.size(); i++) {
-            if (i > 0) {
-                p2.push_back(0);
-                t2.push_back(0);
-                l2.push_back(lang_id);
-            }
-            p2.push_back(phone_ids[i]);
-            t2.push_back(tone_ids[i]);
-            l2.push_back(lang_ids[i]);
+        int N = (int)phone_ids.size();
+        std::vector<int> p2(2 * N + 1, 0);
+        std::vector<int> t2(2 * N + 1, 0);
+        std::vector<int> l2(2 * N + 1, 0); // blanks get lang=0
+        for (int i = 0; i < N; i++) {
+            p2[2 * i + 1] = phone_ids[i];
+            t2[2 * i + 1] = tone_ids[i];
+            l2[2 * i + 1] = lang_ids[i];
         }
         phone_ids = p2;
         tone_ids = t2;
@@ -665,10 +665,29 @@ static void text_encoder_forward(
             float v = phone_table[pid * emb_dim + c]
                     + tone_table[tid * emb_dim + c]
                     + lang_table[lid * emb_dim + c];
-            // BERT projections are zero (disable_bert mode)
             x[t * C + c] = v * sqrt_c;
         }
     }
+
+    // Add BERT projection biases (even with zero BERT input, bias contributes)
+    // bert_proj: Conv1d(1024, hidden, 1) → bias shape (hidden,)
+    // ja_bert_proj: Conv1d(768, hidden, 1) → bias shape (hidden,)
+    // Both are applied to zero input, so output = bias, scaled by sqrt(C)
+    {
+        std::vector<float> bp_bias, jbp_bias;
+        if (w.bert_proj_b) read_tensor_f32(w.bert_proj_b, bp_bias);
+        if (w.ja_bert_proj_b) read_tensor_f32(w.ja_bert_proj_b, jbp_bias);
+        for (int t = 0; t < T; t++) {
+            for (int c = 0; c < C; c++) {
+                float b = 0;
+                if (c < (int)bp_bias.size())  b += bp_bias[c];
+                if (c < (int)jbp_bias.size()) b += jbp_bias[c];
+                x[t * C + c] += b * sqrt_c;
+            }
+        }
+    }
+
+    dump_stage(ctx, "emb_output", x.data(), x.size());
 
     // ── Speaker embedding for encoder conditioning ──
     // g = emb_g[speaker_id] -> (gin_channels,)
@@ -706,13 +725,18 @@ static void text_encoder_forward(
     for (uint32_t il = 0; il < hp.n_layers_enc; il++) {
         const auto & layer = w.enc_layers[il];
 
+        // Speaker conditioning injection at cond_layer_idx
+        if ((int)il == cond_layer_idx && !spk_cond.empty()) {
+            for (int t = 0; t < T; t++)
+                for (int c = 0; c < C; c++)
+                    x[t * C + c] += spk_cond[c];
+        }
+
         // Attention with relative position bias (CPU)
         std::vector<float> attn_out;
         cpu_multihead_attention_relpos(
             x, layer, C, T, H, D, W,
-            spk_cond.empty() ? nullptr : spk_cond.data(),
-            spk_cond.empty() ? 0 : (int)hp.gin_channels,
-            cond_layer_idx, (int)il, attn_out);
+            nullptr, 0, -1, (int)il, attn_out);
 
         // Output projection
         std::vector<float> o;
@@ -751,6 +775,13 @@ static void text_encoder_forward(
 
             for (int i = 0; i < C * T; i++) x[i] += ff_out[i];
             cpu_layer_norm(x, layer.norm2_g, layer.norm2_b, C, T);
+        }
+
+        // Dump each layer output for debugging
+        {
+            char label[64];
+            snprintf(label, sizeof(label), "enc_layer_%u", il);
+            dump_stage(ctx, label, x.data(), x.size());
         }
     }
 
@@ -1940,6 +1971,15 @@ int melotts_synthesize(struct melotts_context * ctx, const char * text,
 
     if (ctx->verbosity >= 2) {
         fprintf(stderr, "melotts: %d phoneme IDs (after intersperse)\n", T);
+    }
+
+    // Dump input IDs
+    {
+        std::vector<float> pid_f(T), tid_f(T), lid_f(T);
+        for (int i = 0; i < T; i++) { pid_f[i] = (float)phone_ids[i]; tid_f[i] = (float)tone_ids[i]; lid_f[i] = (float)lang_ids[i]; }
+        dump_stage(ctx, "phoneme_ids_cpp", pid_f.data(), T);
+        dump_stage(ctx, "tone_ids_cpp", tid_f.data(), T);
+        dump_stage(ctx, "lang_ids_cpp", lid_f.data(), T);
     }
 
     // 2. Speaker embedding
