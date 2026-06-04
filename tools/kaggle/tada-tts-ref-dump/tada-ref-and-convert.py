@@ -14,21 +14,9 @@
 # Triggered from Kaggle UI ("Save Version → Run All").
 
 # %% [code]
-# ── Cell 1: read HF_TOKEN from Kaggle Secrets ──
+# ── Cell 1: env setup ──
 import os
 import sys
-
-try:
-    from kaggle_secrets import UserSecretsClient
-    hf_token_secret = UserSecretsClient().get_secret("HF_TOKEN")
-    print("[cell 1] HF_TOKEN read OK from Kaggle Secrets")
-except Exception as exc:
-    print(f"[cell 1] HF_TOKEN unreadable ({type(exc).__name__}: {exc})")
-    hf_token_secret = os.environ.get("HF_TOKEN")
-
-if hf_token_secret:
-    os.environ["HF_TOKEN"] = hf_token_secret
-    os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token_secret
 
 # Prevent transformers from importing tensorflow (protobuf clash on Kaggle)
 os.environ["TRANSFORMERS_NO_TF"] = "1"
