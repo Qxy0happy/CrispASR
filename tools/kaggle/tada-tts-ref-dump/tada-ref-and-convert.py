@@ -192,6 +192,14 @@ except Exception as exc:
     print(f"[cell 7] upload failed: {exc}")
     print("  Files staged at /kaggle/working/ for manual pickup")
 
+# Clean up the cloned repo from /kaggle/working/ so kernel output
+# only contains the GGUF files (not 2600+ repo files that bloat the
+# output and prevent `kaggle kernels output` from reaching the GGUFs).
+import shutil
+if REPO.exists():
+    shutil.rmtree(str(REPO), ignore_errors=True)
+    print("[cleanup] removed CrispASR clone from working dir")
+
 kh.step("done")
 print("\n=== ALL DONE ===")
 for fpath in [ref_output, model_gguf, codec_gguf]:
