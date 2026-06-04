@@ -114,7 +114,7 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
         else:
             self._decoder = Decoder.from_pretrained("HumeAI/tada-codec", subfolder="decoder")
         # Load tokenizer from the model dir itself (has tokenizer.json)
-        self._tokenizer = AutoTokenizer.from_pretrained(str(path))
+        self._tokenizer = AutoTokenizer.from_pretrained(str(path), use_fast=True)
         return self
 
     TadaForCausalLM.from_pretrained = _patched_from_pretrained
