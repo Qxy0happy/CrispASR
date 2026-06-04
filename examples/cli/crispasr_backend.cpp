@@ -41,6 +41,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_sensevoice_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_voxcpm2_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_cosyvoice3_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_piper_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_melotts_backend();
 #ifdef CRISPASR_HAVE_OUTETTS
 std::unique_ptr<CrispasrBackend> crispasr_make_outetts_backend();
 #endif
@@ -119,6 +120,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_kokoro_backend();
     if (name == "piper" || name == "piper-tts" || name == "piper-vits")
         return crispasr_make_piper_backend();
+    if (name == "melotts" || name == "melo-tts" || name == "melo")
+        return crispasr_make_melotts_backend();
 #ifdef CRISPASR_HAVE_OUTETTS
     if (name == "outetts" || name == "outetts-tts" || name == "oute-tts" || name == "outetts-0.3-1b")
         return crispasr_make_outetts_backend();
@@ -217,6 +220,7 @@ std::vector<std::string> crispasr_list_backends() {
         "pocket-tts",
         "fastpitch",
         "kokoro",
+        "melotts",
         "piper",
         "outetts",
         "voxcpm2-tts",
