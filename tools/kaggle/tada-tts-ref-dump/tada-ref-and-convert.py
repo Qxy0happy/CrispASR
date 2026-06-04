@@ -53,7 +53,17 @@ sys.path.insert(0, str(REPO / "tools" / "kaggle"))
 import kaggle_harness as kh
 kh.init_progress()
 
-# Install deps
+# Nuke tensorflow to avoid protobuf version clash that kills transformers import
+subprocess.check_call([
+    sys.executable, "-m", "pip", "uninstall", "-y", "tensorflow", "tf-keras",
+], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+print("[cell 2] tensorflow removed")
+
+# Install deps (upgrade protobuf to avoid any remaining issues)
+subprocess.check_call([
+    sys.executable, "-m", "pip", "install", "--quiet", "--upgrade",
+    "protobuf",
+])
 subprocess.check_call([
     sys.executable, "-m", "pip", "install", "--quiet",
     "torch", "torchaudio", "transformers", "safetensors", "gguf",
