@@ -215,9 +215,17 @@ def main():
     print(f"  Safetensors:   {len(name_to_idx)} tensors in {len(st_files)} file(s)")
 
     # ── Tokenizer ──
+    # TADA model doesn't ship its own tokenizer — it uses Llama-3.2's.
+    # Try local, then download from unsloth mirror (public, ungated).
     tj = model_dir / "tokenizer.json"
     if not tj.exists():
-        sys.exit("no tokenizer.json — cannot persist BPE vocab")
+        print("  tokenizer.json not in model dir, downloading from unsloth/Llama-3.2-1B...")
+        tok_dir = Path(snapshot_download("unsloth/Llama-3.2-1B", allow_patterns=[
+            "tokenizer.json", "tokenizer_config.json",
+        ]))
+        tj = tok_dir / "tokenizer.json"
+        if not tj.exists():
+            sys.exit("no tokenizer.json found — even unsloth mirror failed")
     with open(tj, encoding="utf-8") as f:
         tjd = json.load(f)
 

@@ -142,23 +142,29 @@ print(f"[cell 4] ref dump: {ref_output} ({ref_output.stat().st_size / 1e6:.1f} M
 # ── Cell 5: convert main model to GGUF ──
 kh.step("converting tada-3b-ml to GGUF")
 model_gguf = WORK / "tada-tts-3b-ml-f16.gguf"
-subprocess.check_call([
-    sys.executable, "models/convert-tada-to-gguf.py",
-    "--input", str(model_dir),
-    "--output", str(model_gguf),
-], cwd=str(REPO))
-print(f"[cell 5] model GGUF: {model_gguf} ({model_gguf.stat().st_size / 1e9:.2f} GB)")
+try:
+    subprocess.check_call([
+        sys.executable, "models/convert-tada-to-gguf.py",
+        "--input", str(model_dir),
+        "--output", str(model_gguf),
+    ], cwd=str(REPO))
+    print(f"[cell 5] model GGUF: {model_gguf} ({model_gguf.stat().st_size / 1e9:.2f} GB)")
+except subprocess.CalledProcessError as e:
+    print(f"[cell 5] WARN: model GGUF conversion failed: {e}")
 
 # %% [code]
 # ── Cell 6: convert codec to GGUF ──
 kh.step("converting tada-codec to GGUF")
 codec_gguf = WORK / "tada-codec-f16.gguf"
-subprocess.check_call([
-    sys.executable, "models/convert-tada-codec-to-gguf.py",
-    "--input", str(codec_dir),
-    "--output", str(codec_gguf),
-], cwd=str(REPO))
-print(f"[cell 6] codec GGUF: {codec_gguf} ({codec_gguf.stat().st_size / 1e9:.2f} GB)")
+try:
+    subprocess.check_call([
+        sys.executable, "models/convert-tada-codec-to-gguf.py",
+        "--input", str(codec_dir),
+        "--output", str(codec_gguf),
+    ], cwd=str(REPO))
+    print(f"[cell 6] codec GGUF: {codec_gguf} ({codec_gguf.stat().st_size / 1e9:.2f} GB)")
+except subprocess.CalledProcessError as e:
+    print(f"[cell 6] WARN: codec GGUF conversion failed: {e}")
 
 # %% [code]
 # ── Cell 7: upload to HuggingFace ──
