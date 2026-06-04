@@ -282,12 +282,17 @@ def main():
         # But ggml_get_rows uses (vocab, dim) which matches PyTorch embedding shape.
         # For Conv1d 1x1 (stored as 3D with K=1), the transpose_conv_weight handles it.
 
-        # Quantization: 1D -> F32, embeddings -> F32, other 2D+ -> F16
-        # Embeddings are small and errors amplify through sqrt(hidden) scaling
+        # Quantization strategy:
+        # - 1D (norms, biases): always F32
+        # - Embeddings: F32 (errors amplify through sqrt(hidden) scaling)
+        # - SDP spline weights: F32 (rational quadratic splines are
+        #   numerically sensitive, F16 causes audible degradation)
+        # - Everything else: F16
         is_emb = name.endswith(".weight") and (
             "emb" in name or "emb_g" in name or "emb_rel" in name
         )
-        if arr.ndim <= 1 or is_emb:
+        is_sdp = name.startswith("sdp.") or name.startswith("dp.")
+        if arr.ndim <= 1 or is_emb or is_sdp:
             writer.add_tensor(name, arr.astype(np.float32))
         else:
             writer.add_tensor(name, arr.astype(np.float16))
