@@ -113,14 +113,30 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
             self._decoder = Decoder.from_pretrained(codec_dir, subfolder="decoder")
         else:
             self._decoder = Decoder.from_pretrained("HumeAI/tada-codec", subfolder="decoder")
-        # Load tokenizer from the model dir itself (has tokenizer.json)
-        # Load fast tokenizer directly from tokenizer.json — TADA dir has
-        # no tokenizer.model (sentencepiece), so AutoTokenizer's Llama slow
-        # path crashes. PreTrainedTokenizerFast bypasses the slow tokenizer.
-        from transformers import PreTrainedTokenizerFast
-        self._tokenizer = PreTrainedTokenizerFast(
-            tokenizer_file=str(Path(path) / "tokenizer.json")
-        )
+        # TADA's tokenizer comes from meta-llama/Llama-3.2-1B (gated repo).
+        # The model dir has NO tokenizer files. Try loading with HF token;
+        # fall back to downloading tokenizer.json from the hume-tada package
+        # data or from a non-gated mirror.
+        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        tokenizer_name = getattr(self.config, "tokenizer_name", "meta-llama/Llama-3.2-1B")
+        try:
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_name, token=hf_token, use_fast=True
+            )
+        except Exception as e:
+            print(f"  WARN: failed to load tokenizer from {tokenizer_name}: {e}")
+            print(f"  Falling back to GPT2TokenizerFast as a Llama-3.2 compatible tokenizer")
+            # Llama-3.2 uses a BPE tokenizer with 128256 vocab. As a fallback,
+            # try loading from the unsloth mirror (public, Llama-compatible).
+            try:
+                self._tokenizer = AutoTokenizer.from_pretrained(
+                    "unsloth/Llama-3.2-1B", use_fast=True
+                )
+            except Exception:
+                raise RuntimeError(
+                    f"Cannot load tokenizer for TADA. Set HF_TOKEN env var "
+                    f"and accept the Llama license at huggingface.co/meta-llama/Llama-3.2-1B"
+                ) from e
         return self
 
     TadaForCausalLM.from_pretrained = _patched_from_pretrained
