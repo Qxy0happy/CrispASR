@@ -245,7 +245,7 @@ def main():
     writer.add_float32("melotts.noise_scale", 0.667)
     writer.add_float32("melotts.length_scale", 1.0)
     writer.add_float32("melotts.noise_w", 0.8)
-    writer.add_float32("melotts.sdp_ratio", 0.2)
+    writer.add_float32("melotts.sdp_ratio", 0.0)  # 0 for disable-bert; 0.2 with BERT
 
     # Text processing data
     writer.add_string("melotts.symbols_json", json.dumps(symbols))

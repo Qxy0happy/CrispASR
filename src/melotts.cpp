@@ -250,7 +250,7 @@ struct melotts_hparams {
     float noise_scale  = 0.667f;
     float length_scale = 1.0f;
     float noise_w      = 0.8f;
-    float sdp_ratio    = 0.2f;
+    float sdp_ratio    = 0.0f; // default 0 for disable-bert; 0.2 with BERT
 
     std::vector<uint32_t> upsample_rates;
     std::vector<uint32_t> upsample_kernels;
