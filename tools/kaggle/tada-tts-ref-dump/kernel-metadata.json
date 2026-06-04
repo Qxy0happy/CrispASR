@@ -1,6 +1,6 @@
 {
-  "id": "chr1str/tada-tts-ref-dump",
-  "title": "TADA-3B-ML Reference Dump + GGUF Conversion",
+  "id": "chr1str/tada-3b-ml-reference-dump-gguf-conversion",
+  "title": "tada-3b-ml-reference-dump-gguf-conversion",
   "code_file": "tada-ref-and-convert.py",
   "language": "python",
   "kernel_type": "script",
