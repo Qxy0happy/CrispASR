@@ -167,11 +167,17 @@ struct ov2_hifigan {
     ggml_tensor * cond_b;
 };
 
+struct ov2_base_speaker {
+    std::string name;
+    ggml_tensor * embedding;  // (gin_channels,) F32
+};
+
 struct ov2_weights {
     ov2_ref_enc ref_enc;
     ov2_enc_q enc_q;
     std::vector<ov2_flow_block> flow_blocks;
     ov2_hifigan dec;
+    std::vector<ov2_base_speaker> base_speakers;
 };
 
 // ── Context ──────────────────────────────────────────────────────────
@@ -336,8 +342,16 @@ extern "C" struct openvoice2_context * openvoice2_init_from_file(
     ctx->w_buf = wl.buf;
     auto & tensors = wl.tensors;
 
+    // Base speaker embeddings
+    for (auto & [name, tensor] : tensors) {
+        if (name.rfind("base_speaker.", 0) == 0) {
+            std::string spk_name = name.substr(strlen("base_speaker."));
+            ctx->w.base_speakers.push_back({spk_name, tensor});
+        }
+    }
     if (ctx->verbosity >= 1)
-        fprintf(stderr, "openvoice2: loaded %zu tensors\n", tensors.size());
+        fprintf(stderr, "openvoice2: loaded %zu tensors, %zu base speakers\n",
+                tensors.size(), ctx->w.base_speakers.size());
 
     // Set up scheduler
     ggml_backend_t backends[2];
@@ -1130,10 +1144,24 @@ extern "C" bool openvoice2_convert(
         vec_stats("enc_q_z", z);
     }
 
-    // 4. For voice conversion we need the source speaker embedding too.
-    //    Extract from source audio.
+    // 4. Source speaker embedding — use pre-saved base speaker if available
+    //    (upstream OpenVoice2 uses base_speakers/ses/en-default.pth, not ref_enc).
     std::vector<float> src_se;
-    ref_enc_forward(ctx, src_spec, T_src, src_se);
+    if (!ctx->w.base_speakers.empty()) {
+        // Default to first base speaker (en-au alphabetically, or en-default if present)
+        const ov2_base_speaker * best = &ctx->w.base_speakers[0];
+        for (const auto & bs : ctx->w.base_speakers) {
+            if (bs.name == "en-default") { best = &bs; break; }
+        }
+        read_f32(best->embedding, src_se);
+        if (ctx->verbosity >= 1)
+            fprintf(stderr, "openvoice2: using base speaker '%s' as source SE\n", best->name.c_str());
+    } else {
+        // Fallback: extract from source audio (less accurate for synthetic input)
+        ref_enc_forward(ctx, src_spec, T_src, src_se);
+        if (ctx->verbosity >= 1)
+            fprintf(stderr, "openvoice2: extracted source SE from audio (no base speakers in GGUF)\n");
+    }
 
     // 5. Flow forward: z → z_p (normalize with source voice)
     flow_wavenet(ctx, z, T_src, src_se, /*reverse=*/false);
