@@ -173,9 +173,9 @@ if model_gguf.exists() and model_gguf.stat().st_size > 0:
         )
         kh.sh_with_progress(
             f"cmake --build {build_dir} -j{kh.safe_build_jobs(gpu=False)}"
-            f" --target quantize"
+            f" --target crispasr-quantize"
         )
-        quantize_bin = build_dir / "bin" / "quantize"
+        quantize_bin = build_dir / "bin" / "crispasr-quantize"
         if quantize_bin.exists():
             kh.sh_with_progress(f"{quantize_bin} {model_gguf} {model_q8} Q8_0")
             print(f"[cell 7] Q8_0: {model_q8} ({model_q8.stat().st_size / 1e9:.2f} GB)")
