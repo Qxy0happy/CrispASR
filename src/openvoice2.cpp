@@ -1008,12 +1008,14 @@ static bool hifigan_decode_cpu(openvoice2_context* ctx, const std::vector<float>
 
     // conv_pre: (inter_channels, T) → (upsample_initial_ch=512, T)
     ggml_tensor* x = conv1d_cf(gc, x_input, dec.conv_pre_w, dec.conv_pre_b, 1, 3, 1);
+    ggml_set_name(x, "dec_conv_pre_out"); ggml_set_output(x);
 
     // Speaker conditioning: x += cond(g)
     if (g_input && dec.cond_w) {
         ggml_tensor* g_2d = ggml_reshape_2d(gc, g_input, gin, 1);
         ggml_tensor* g_proj = conv1d_cf(gc, g_2d, dec.cond_w, dec.cond_b);
         x = ggml_add(gc, x, g_proj);
+        ggml_set_name(x, "dec_after_cond"); ggml_set_output(x);
     }
 
     // Upsample stages
@@ -1028,6 +1030,11 @@ static bool hifigan_decode_cpu(openvoice2_context* ctx, const std::vector<float>
         int crop_each = (kernel - stride) / 2;
 
         x = core_convt::convt1d_crop(gc, x, dec.ups[us].w, dec.ups[us].b, stride, crop_each, crop_each);
+
+        {
+            char nm[32]; snprintf(nm, sizeof(nm), "dec_ups_%d", us);
+            ggml_set_name(x, nm); ggml_set_output(x);
+        }
 
         // MRF: average of resblocks
         ggml_tensor* sum_rb = nullptr;
@@ -1056,6 +1063,10 @@ static bool hifigan_decode_cpu(openvoice2_context* ctx, const std::vector<float>
         }
 
         x = ggml_scale(gc, sum_rb, 1.0f / (float)n_rk);
+        {
+            char nm[32]; snprintf(nm, sizeof(nm), "dec_stage_%d", us);
+            ggml_set_name(x, nm); ggml_set_output(x);
+        }
         rb_idx += n_rk;
     }
 
@@ -1075,17 +1086,39 @@ static bool hifigan_decode_cpu(openvoice2_context* ctx, const std::vector<float>
         return false;
     }
 
-    // z is in (T, C) row-major layout but the ggml tensor is (C, T) channels-first.
-    // Transpose before setting.
-    std::vector<float> z_ct(z.size());
-    for (int t = 0; t < T_latent; t++)
-        for (int c = 0; c < C_in; c++)
-            z_ct[c * T_latent + t] = z[t * C_in + c];
-    ggml_backend_tensor_set(x_input, z_ct.data(), 0, z_ct.size() * sizeof(float));
+    // z is in (T, C) row-major = C is the fast dimension.
+    // ggml tensor (C_in, T_latent) has ne[0]=C_in (fast) — matches z layout directly.
+    // conv1d_cf transposes internally for ggml_conv_1d.
+    ggml_backend_tensor_set(x_input, z.data(), 0, z.size() * sizeof(float));
     if (g_input && !g_vec.empty())
         ggml_backend_tensor_set(g_input, g_vec.data(), 0, gin * sizeof(float));
 
     ggml_backend_sched_graph_compute(ctx->sched, gf);
+
+    // Dump intermediate HiFi-GAN stages by name
+    {
+        const char* stage_names[] = {
+            "dec_conv_pre_out", "dec_after_cond",
+            "dec_ups_0", "dec_stage_0", "dec_ups_1", "dec_stage_1",
+            "dec_ups_2", "dec_stage_2", "dec_ups_3", "dec_stage_3",
+            nullptr
+        };
+        for (int si = 0; stage_names[si]; si++) {
+            ggml_tensor* node = ggml_graph_get_tensor(gf, stage_names[si]);
+            if (!node) continue;
+            int64_t ne = ggml_nelements(node);
+            std::vector<float> tmp(ne);
+            ggml_backend_tensor_get(node, tmp.data(), 0, ne * sizeof(float));
+            dump_stage(ctx, stage_names[si], tmp.data(), tmp.size());
+            if (ctx->verbosity >= 2) {
+                float mn = *std::min_element(tmp.begin(), tmp.end());
+                float mx = *std::max_element(tmp.begin(), tmp.end());
+                double sm = 0; for (auto v : tmp) sm += v;
+                fprintf(stderr, "openvoice2: %s (%lld elems) mean=%.6f min=%.4f max=%.4f\n",
+                        stage_names[si], (long long)ne, (float)(sm/ne), mn, mx);
+            }
+        }
+    }
 
     int T_audio = (int)ggml_nelements(x);
     pcm_out.resize(T_audio);
