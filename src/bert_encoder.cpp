@@ -443,3 +443,75 @@ extern "C" bool bert_encoder_forward(struct bert_encoder_context* ctx, const cha
 extern "C" int bert_encoder_hidden_size(const struct bert_encoder_context* ctx) {
     return ctx ? ctx->hidden_size : 768;
 }
+
+extern "C" int bert_encoder_tokenize(const struct bert_encoder_context* ctx, const char* text, int** out_ids) {
+    if (!ctx || !text || !out_ids)
+        return 0;
+    auto ids = bert_tokenize(ctx->tok, text);
+    int n = (int)ids.size();
+    *out_ids = (int*)malloc(n * sizeof(int));
+    memcpy(*out_ids, ids.data(), n * sizeof(int));
+    return n;
+}
+
+extern "C" int bert_encoder_word_subtokens(const struct bert_encoder_context* ctx, const char* text,
+                                           int** out_subtokens) {
+    if (!ctx || !text || !out_subtokens)
+        return 0;
+
+    // Tokenize to get the subword tokens
+    auto ids = bert_tokenize(ctx->tok, text);
+    // ids[0] = [CLS], ids[n-1] = [SEP], content = ids[1..n-2]
+
+    // Reconstruct which content tokens belong to which whitespace word
+    // Approach: re-tokenize word by word, count subwords per word
+    std::string lower = to_lower_bert(text);
+    std::vector<std::string> words;
+    std::string cur;
+    for (char c : lower) {
+        if (c == ' ' || c == '\t' || c == '\n') {
+            if (!cur.empty()) {
+                words.push_back(cur);
+                cur.clear();
+            }
+        } else {
+            cur += c;
+        }
+    }
+    if (!cur.empty())
+        words.push_back(cur);
+
+    // For each word, count how many BERT subwords it produces
+    std::vector<int> subtokens;
+    for (const auto& word : words) {
+        // Tokenize this single word
+        int n_sub = 0;
+        auto it = ctx->tok.vocab.find(word);
+        if (it != ctx->tok.vocab.end()) {
+            n_sub = 1;
+        } else {
+            // WordPiece split
+            size_t start = 0;
+            while (start < word.size()) {
+                size_t end = word.size();
+                while (end > start) {
+                    std::string sub = (start == 0) ? word.substr(0, end) : "##" + word.substr(start, end - start);
+                    if (ctx->tok.vocab.count(sub))
+                        break;
+                    end--;
+                }
+                n_sub++;
+                if (end == start)
+                    start++;
+                else
+                    start = end;
+            }
+        }
+        subtokens.push_back(n_sub);
+    }
+
+    int n_words = (int)subtokens.size();
+    *out_subtokens = (int*)malloc(n_words * sizeof(int));
+    memcpy(*out_subtokens, subtokens.data(), n_words * sizeof(int));
+    return n_words;
+}

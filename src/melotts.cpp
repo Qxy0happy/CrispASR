@@ -2480,32 +2480,65 @@ int melotts_synthesize(struct melotts_context* ctx, const char* text, float** pc
         int n_bert_tokens = 0;
         if (bert_encoder_forward(ctx->bert_ctx, text, &bert_out, &n_bert_tokens)) {
             int bert_dim = bert_encoder_hidden_size(ctx->bert_ctx);
-            // bert_out is (n_bert_tokens, bert_dim) row-major
-            // Expand to (bert_dim, T) using word2ph mapping:
-            // Each word2ph[i] phones get repeated BERT features from token i
+
+            // Build BERT-aligned word2ph: for each whitespace word,
+            // get how many BERT subwords it has, then distribute the
+            // word's phonemes across those subwords (matching Python's
+            // distribute_phone from japanese.py).
+            int* subtokens = nullptr;
+            int n_words = bert_encoder_word_subtokens(ctx->bert_ctx, text, &subtokens);
+
+            // Build per-BERT-token phone counts
+            // word2ph has: [pad] [word0_phones] [word1_phones] ... [pad]
+            // subtokens has: [n_sub_word0] [n_sub_word1] ...
+            // BERT tokens: [CLS] [sub00 sub01..] [sub10..] ... [SEP]
+            std::vector<int> bert_word2ph;
+            bert_word2ph.push_back(word2ph[0]); // leading pad → [CLS]
+
+            int w2p_idx = 1; // skip leading pad
+            for (int wi = 0; wi < n_words && w2p_idx < (int)word2ph.size() - 1; wi++) {
+                int n_phones_word = word2ph[w2p_idx];
+                int n_sub = subtokens[wi];
+                // distribute_phone: split n_phones evenly across n_sub tokens
+                if (n_sub <= 1) {
+                    bert_word2ph.push_back(n_phones_word);
+                } else {
+                    int base = n_phones_word / n_sub;
+                    int remainder = n_phones_word % n_sub;
+                    for (int s = 0; s < n_sub; s++) {
+                        bert_word2ph.push_back(base + (s < remainder ? 1 : 0));
+                    }
+                }
+                w2p_idx++;
+            }
+
+            // trailing pad → [SEP]
+            if (w2p_idx < (int)word2ph.size())
+                bert_word2ph.push_back(word2ph.back());
+            free(subtokens);
+
+            // Expand BERT features using bert_word2ph
             ja_bert_features.resize(bert_dim * T, 0.0f);
             int phone_pos = 0;
-            int bert_tok = 0;
-            for (int wi = 0; wi < (int)word2ph.size() && phone_pos < T; wi++) {
-                int n_phones = word2ph[wi];
-                int bt = std::clamp(bert_tok, 0, n_bert_tokens - 1);
+            for (int bi = 0; bi < (int)bert_word2ph.size() && phone_pos < T; bi++) {
+                int n_phones = bert_word2ph[bi];
+                int bt = std::clamp(bi, 0, n_bert_tokens - 1);
                 for (int p = 0; p < n_phones && phone_pos < T; p++) {
                     for (int c = 0; c < bert_dim; c++)
                         ja_bert_features[c * T + phone_pos] = bert_out[bt * bert_dim + c];
                     phone_pos++;
                 }
-                bert_tok++;
             }
-            // Fill remaining with last token
             while (phone_pos < T) {
-                int bt = std::clamp(n_bert_tokens - 1, 0, n_bert_tokens - 1);
+                int bt = n_bert_tokens - 1;
                 for (int c = 0; c < bert_dim; c++)
                     ja_bert_features[c * T + phone_pos] = bert_out[bt * bert_dim + c];
                 phone_pos++;
             }
             free(bert_out);
             if (ctx->verbosity >= 2)
-                fprintf(stderr, "melotts: BERT %d tokens → %d phones (dim=%d)\n", n_bert_tokens, T, bert_dim);
+                fprintf(stderr, "melotts: BERT %d tokens, %d word2ph entries → %d phones\n", n_bert_tokens,
+                        (int)bert_word2ph.size(), T);
         }
     }
 

@@ -37,6 +37,17 @@ bool bert_encoder_forward(struct bert_encoder_context* ctx, const char* text, fl
 // Get the hidden size (768 for bert-base-uncased).
 int bert_encoder_hidden_size(const struct bert_encoder_context* ctx);
 
+// Tokenize text into BERT token IDs (including [CLS] and [SEP]).
+// Returns number of tokens. out_ids must be freed by caller.
+int bert_encoder_tokenize(const struct bert_encoder_context* ctx, const char* text, int** out_ids);
+
+// Get the number of whitespace words that a BERT token sequence spans.
+// For each whitespace word, returns the number of BERT subword tokens.
+// E.g. "seashells" → ["seas", "##hell", "##s"] → n_subtokens=3.
+// out_subtokens: array of subtokens-per-word. Caller frees.
+// Returns number of words.
+int bert_encoder_word_subtokens(const struct bert_encoder_context* ctx, const char* text, int** out_subtokens);
+
 #ifdef __cplusplus
 }
 #endif
