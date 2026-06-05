@@ -146,6 +146,13 @@ struct tada_context {
     std::string codec_path;
     tada_codec_context* codec_ctx = nullptr;
 
+    // Pre-computed voice prompt (from GGUF)
+    std::vector<float> prompt_values;     // (n_prompt, acoustic_dim) flat
+    std::vector<int32_t> prompt_masks;    // (n_prompt,) all 1s
+    std::vector<int32_t> prompt_time_before; // (n_prompt,) time gaps
+    std::vector<int32_t> prompt_time_after;  // (n_prompt,) time gaps
+    int n_prompt = 0;
+
     uint64_t rng_state = 0;
 };
 
@@ -864,6 +871,72 @@ int tada_set_codec_path(struct tada_context* ctx, const char* path) {
     return 0;
 }
 
+int tada_load_prompt(struct tada_context* ctx, const char* path) {
+    if (!ctx || !path) return -1;
+
+    // Load the reference GGUF containing prompt_token_values and prompt_token_positions
+    gguf_context* meta = core_gguf::open_metadata(path);
+    if (!meta) return -1;
+    core_gguf::free_metadata(meta);
+
+    core_gguf::WeightLoad wl;
+    if (!core_gguf::load_weights(path, ctx->backend, "tada-prompt", wl)) {
+        fprintf(stderr, "tada: failed to load prompt from %s\n", path);
+        return -1;
+    }
+
+    // Extract prompt_token_values: (n_prompt, acoustic_dim) = ggml ne=[acoustic_dim, n_prompt]
+    ggml_tensor* tv = core_gguf::try_get(wl.tensors, "prompt_token_values");
+    ggml_tensor* tp = core_gguf::try_get(wl.tensors, "prompt_token_positions");
+    if (!tv) {
+        fprintf(stderr, "tada: prompt_token_values not found in %s\n", path);
+        return -1;
+    }
+
+    const int ad = (int)ctx->hp.acoustic_dim;
+    const int np = (int)(ggml_nelements(tv) / ad);
+    ctx->n_prompt = np;
+
+    // Read token values
+    ctx->prompt_values.resize(np * ad);
+    ggml_backend_tensor_get(tv, ctx->prompt_values.data(), 0,
+                             (size_t)np * ad * sizeof(float));
+
+    // Read positions and compute time gaps
+    if (tp) {
+        std::vector<float> pos(np);
+        ggml_backend_tensor_get(tp, pos.data(), 0, (size_t)np * sizeof(float));
+
+        // Time gaps: time_before[i] = positions[i] - positions[i-1], clamped to [0, num_time_classes-1]
+        int max_t = (int)ctx->hp.num_time_classes - 1;
+        ctx->prompt_time_before.resize(np + 1, 0);
+        ctx->prompt_time_after.resize(np + 1, 0);
+        for (int i = 0; i < np; i++) {
+            int p_cur = (int)pos[i];
+            int p_prev = (i > 0) ? (int)pos[i - 1] : 0;
+            int gap = std::min(std::max(p_cur - p_prev, 0), max_t);
+            ctx->prompt_time_before[i + 1] = gap;  // shifted by 1 (index 0 is padding)
+        }
+        // time_after[i] = time_before[i+1]
+        for (int i = 0; i < np; i++) {
+            ctx->prompt_time_after[i] = (i + 1 < (int)ctx->prompt_time_before.size())
+                                         ? ctx->prompt_time_before[i + 1] : 1;
+        }
+    }
+
+    // Masks: all 1 for prompt tokens
+    ctx->prompt_masks.assign(np, 1);
+
+    // Clean up
+    if (wl.buf) ggml_backend_buffer_free(wl.buf);
+    if (wl.ctx) ggml_free(wl.ctx);
+
+    if (ctx->params.verbosity >= 1) {
+        fprintf(stderr, "tada: loaded prompt with %d tokens from %s\n", np, path);
+    }
+    return 0;
+}
+
 void tada_set_seed(struct tada_context* ctx, uint64_t seed) {
     if (ctx) ctx->rng_state = seed ? seed : 42;
 }
@@ -986,19 +1059,38 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
 
         // Update state for next step
         if (step >= shift) {
-            // Use FM output as acoustic features
-            std::vector<float> feat(speech.begin(), speech.begin() + ad);
-            acoustic_features.push_back(feat);
-            time_before_list.push_back(pred_t_before);
+            int feat_idx = step - shift;
+            bool use_prompt = (ctx->n_prompt > 0 && feat_idx < ctx->n_prompt);
 
-            cur_acoustic = feat;
-            cur_mask = 1;
+            if (use_prompt) {
+                // Use pre-computed prompt features
+                std::vector<float> feat(ctx->prompt_values.begin() + feat_idx * ad,
+                                         ctx->prompt_values.begin() + (feat_idx + 1) * ad);
+                acoustic_features.push_back(feat);
+                int tb = (feat_idx + 1 < (int)ctx->prompt_time_before.size())
+                         ? ctx->prompt_time_before[feat_idx + 1] : pred_t_before;
+                time_before_list.push_back(tb);
+                cur_acoustic = feat;
+                cur_mask = 1;
+                cur_t_before = tb;
+                cur_t_after = (feat_idx + 1 < (int)ctx->prompt_time_after.size())
+                              ? ctx->prompt_time_after[feat_idx + 1] : pred_t_after;
+            } else {
+                // Use FM-predicted features
+                std::vector<float> feat(speech.begin(), speech.begin() + ad);
+                acoustic_features.push_back(feat);
+                time_before_list.push_back(pred_t_before);
+                cur_acoustic = feat;
+                cur_mask = 1;
+                cur_t_before = pred_t_before;
+                cur_t_after = pred_t_after;
+            }
         } else {
             std::fill(cur_acoustic.begin(), cur_acoustic.end(), 0.0f);
             cur_mask = 0;
+            cur_t_before = pred_t_before;
+            cur_t_after = pred_t_after;
         }
-        cur_t_before = pred_t_before;
-        cur_t_after = pred_t_after;
 
         free(tr.hidden);
     }

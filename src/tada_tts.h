@@ -47,6 +47,11 @@ struct tada_context* tada_init_from_file(const char* path_model,
 // Set the companion codec GGUF path (required before synthesize).
 int tada_set_codec_path(struct tada_context* ctx, const char* path);
 
+// Load a pre-computed voice prompt from a GGUF file containing
+// prompt_token_values (N, 512) and prompt_token_positions (N,).
+// This bypasses the Encoder and provides voice conditioning directly.
+int tada_load_prompt(struct tada_context* ctx, const char* path);
+
 // Set generation seed for reproducibility.
 void tada_set_seed(struct tada_context* ctx, uint64_t seed);
 

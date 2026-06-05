@@ -102,6 +102,16 @@ public:
             fprintf(stderr, "crispasr[tada]: no codec found. "
                     "Pass --codec-model PATH or place tada-codec.gguf next to model.\n");
         }
+        // Load pre-computed voice prompt if --tts-voice-prompt or TADA_PROMPT_CACHE is set
+        std::string prompt_path;
+        const char* env = getenv("TADA_PROMPT_CACHE");
+        if (env) prompt_path = env;
+        if (!prompt_path.empty()) {
+            if (tada_load_prompt(ctx_, prompt_path.c_str()) != 0) {
+                fprintf(stderr, "crispasr[tada]: failed to load prompt from '%s'\n",
+                        prompt_path.c_str());
+            }
+        }
         return true;
     }
 
