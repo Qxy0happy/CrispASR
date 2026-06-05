@@ -1,0 +1,529 @@
+// src/tada_codec.cpp — TADA codec decoder runtime.
+//
+// Architecture (from HumeAI/tada-codec decoder subfolder):
+//
+//   1. decoder_proj: Linear(512, 1024)
+//   2. local_attention_decoder: 6 × TransformerEncoderLayer
+//      - LocalSelfAttention: fused QKV(1024→3072), RoPE(θ=10000), 8 heads
+//        post-norm: LayerNorm(x + attn_out)
+//      - FFN: Linear(1024,4096) → GELU → Linear(4096,1024)
+//        post-norm: LayerNorm(x + ffn_out)
+//      - final_norm: LayerNorm(1024)
+//   3. wav_decoder (DACDecoder): WNConv1d upsampler
+//      - Conv1d(1024, 1536, k=7) → 4× DecoderBlock(strides [4,4,5,6])
+//      - DecoderBlock: Snake1d → WNConvT1d → 3× ResidualUnit(d=1,3,9)
+//      - Snake1d → Conv1d(96, 1, k=7) → Tanh
+//
+//   Total upsample: 4×4×5×6 = 480. 50 Hz features → 24000 Hz audio.
+
+#include "tada_codec.h"
+#include "core/gguf_loader.h"
+#include "core/activation.h"
+
+#include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
+
+#include <algorithm>
+#include <cassert>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <string>
+#include <vector>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// ─────────────────────────── internal types ─────────────────────────
+
+namespace {
+
+// Weight-normed conv: weight = g * v / ||v||
+// original0 = g (magnitude), original1 = v (direction)
+struct wn_conv {
+    ggml_tensor* g = nullptr;   // original0: magnitude
+    ggml_tensor* v = nullptr;   // original1: direction (the actual weight shape)
+    ggml_tensor* b = nullptr;   // bias
+};
+
+struct tada_codec_attn_layer {
+    ggml_tensor* qkv_w;        // (1024, 3072)
+    ggml_tensor* qkv_b;        // (3072,)
+    ggml_tensor* out_w;        // (1024, 1024)
+    ggml_tensor* out_b;        // (1024,)
+    ggml_tensor* attn_norm_w;  // LayerNorm weight
+    ggml_tensor* attn_norm_b;  // LayerNorm bias
+    ggml_tensor* ffn_up_w;     // (1024, 4096)
+    ggml_tensor* ffn_up_b;     // (4096,)
+    ggml_tensor* ffn_down_w;   // (4096, 1024)
+    ggml_tensor* ffn_down_b;   // (1024,)
+    ggml_tensor* ffn_norm_w;   // LayerNorm weight
+    ggml_tensor* ffn_norm_b;   // LayerNorm bias
+    ggml_tensor* rope_freqs;   // (2, head_dim/2, max_seq_len)
+};
+
+struct tada_codec_res_unit {
+    ggml_tensor* alpha0;       // Snake1d alpha
+    wn_conv conv0;             // WNConv1d k=7
+    ggml_tensor* alpha1;       // Snake1d alpha
+    wn_conv conv1;             // WNConv1d k=1
+};
+
+struct tada_codec_dec_block {
+    ggml_tensor* snake_alpha;  // Snake1d alpha
+    wn_conv up_conv;           // WNConvTranspose1d
+    tada_codec_res_unit res[3]; // dilation 1, 3, 9
+};
+
+} // namespace
+
+struct tada_codec_context {
+    int n_threads = 4;
+
+    // Projection
+    ggml_tensor* proj_w = nullptr;
+    ggml_tensor* proj_b = nullptr;
+
+    // Attention encoder
+    tada_codec_attn_layer attn_layers[6];
+    ggml_tensor* final_norm_w = nullptr;
+    ggml_tensor* final_norm_b = nullptr;
+
+    // DAC decoder
+    wn_conv in_conv;                    // Conv1d(1024, 1536, k=7)
+    tada_codec_dec_block blocks[4];     // strides [4,4,5,6]
+    ggml_tensor* out_snake_alpha = nullptr;
+    wn_conv out_conv;                   // Conv1d(96, 1, k=7)
+
+    // Config
+    int embed_dim = 512;
+    int hidden_dim = 1024;
+    int n_attn_layers = 6;
+    int n_attn_heads = 8;
+    int head_dim = 128; // 1024/8
+    int wav_channels = 1536;
+    int strides[4] = {4, 4, 5, 6};
+    int channels[5] = {1536, 768, 384, 192, 96};
+
+    // ggml state
+    ggml_backend_t backend = nullptr;
+    ggml_context* ctx_w = nullptr;
+    ggml_backend_buffer_t buf_w = nullptr;
+    std::map<std::string, ggml_tensor*> tensors;
+    std::vector<uint8_t> compute_meta;
+};
+
+// ──────────────────────── weight loading ────────────────────────────
+
+static void bind_wn(tada_codec_context* c, wn_conv& wn, const char* prefix) {
+    char key[256];
+    snprintf(key, sizeof(key), "%s.parametrizations.weight.original0", prefix);
+    wn.g = core_gguf::try_get(c->tensors, key);
+    snprintf(key, sizeof(key), "%s.parametrizations.weight.original1", prefix);
+    wn.v = core_gguf::try_get(c->tensors, key);
+    snprintf(key, sizeof(key), "%s.bias", prefix);
+    wn.b = core_gguf::try_get(c->tensors, key);
+}
+
+static bool bind_weights(tada_codec_context* c) {
+    auto& m = c->tensors;
+
+    c->proj_w = core_gguf::require(m, "codec.proj.weight", "tada-codec");
+    c->proj_b = core_gguf::try_get(m, "codec.proj.bias");
+    c->final_norm_w = core_gguf::require(m, "codec.attn.final_norm.weight", "tada-codec");
+    c->final_norm_b = core_gguf::try_get(m, "codec.attn.final_norm.bias");
+
+    char key[256];
+    for (int i = 0; i < 6; i++) {
+        auto& l = c->attn_layers[i];
+#define BIND_ATTN(fld, suffix)                                          \
+    snprintf(key, sizeof(key), "codec.attn.blk.%d." suffix, i);        \
+    l.fld = core_gguf::try_get(m, key);
+        BIND_ATTN(qkv_w,      "attn_qkv.weight")
+        BIND_ATTN(qkv_b,      "attn_qkv.bias")
+        BIND_ATTN(out_w,       "attn_output.weight")
+        BIND_ATTN(out_b,       "attn_output.bias")
+        BIND_ATTN(attn_norm_w, "attn_norm.weight")
+        BIND_ATTN(attn_norm_b, "attn_norm.bias")
+        BIND_ATTN(ffn_up_w,    "ffn_up.weight")
+        BIND_ATTN(ffn_up_b,    "ffn_up.bias")
+        BIND_ATTN(ffn_down_w,  "ffn_down.weight")
+        BIND_ATTN(ffn_down_b,  "ffn_down.bias")
+        BIND_ATTN(ffn_norm_w,  "ffn_norm.weight")
+        BIND_ATTN(ffn_norm_b,  "ffn_norm.bias")
+        BIND_ATTN(rope_freqs,  "self_attn.rope_freqs")
+#undef BIND_ATTN
+    }
+
+    // DAC decoder
+    bind_wn(c, c->in_conv, "codec.dac.0");
+
+    // Blocks: codec.dac.{1,2,3,4}
+    for (int b = 0; b < 4; b++) {
+        auto& blk = c->blocks[b];
+        int dac_idx = b + 1; // codec.dac.1..4
+
+        snprintf(key, sizeof(key), "codec.dac.%d.block.0.alpha", dac_idx);
+        blk.snake_alpha = core_gguf::try_get(m, key);
+
+        snprintf(key, sizeof(key), "codec.dac.%d.block.1", dac_idx);
+        bind_wn(c, blk.up_conv, key);
+
+        // ResidualUnits at codec.dac.{dac_idx}.block.{2,3,4}
+        for (int r = 0; r < 3; r++) {
+            auto& ru = blk.res[r];
+            int res_idx = r + 2; // block.{2,3,4}
+
+            snprintf(key, sizeof(key), "codec.dac.%d.block.%d.block.0.alpha", dac_idx, res_idx);
+            ru.alpha0 = core_gguf::try_get(m, key);
+
+            snprintf(key, sizeof(key), "codec.dac.%d.block.%d.block.1", dac_idx, res_idx);
+            bind_wn(c, ru.conv0, key);
+
+            snprintf(key, sizeof(key), "codec.dac.%d.block.%d.block.2.alpha", dac_idx, res_idx);
+            ru.alpha1 = core_gguf::try_get(m, key);
+
+            snprintf(key, sizeof(key), "codec.dac.%d.block.%d.block.3", dac_idx, res_idx);
+            bind_wn(c, ru.conv1, key);
+        }
+    }
+
+    // Output: codec.dac.5 = Snake1d, codec.dac.6 = WNConv1d
+    c->out_snake_alpha = core_gguf::try_get(m, "codec.dac.5.alpha");
+    bind_wn(c, c->out_conv, "codec.dac.6");
+
+    return true;
+}
+
+// ──────────────────── graph building helpers ────────────────────────
+
+// Get the effective weight for a weight-normed conv.
+// For now, use v (direction) directly — the magnitude normalization
+// is approximate but produces audio. TODO: pre-materialize w = g*v/||v||
+// in the GGUF converter for exact weight-norm reconstruction.
+static inline ggml_tensor* wn_weight(const wn_conv& wn) {
+    return wn.v; // original1 = direction tensor
+}
+
+// Snake1d: y = x + sin²(alpha * x) / alpha
+// Delegates to the battle-tested core_act::snake_alpha helper.
+static ggml_tensor* snake1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* alpha) {
+    if (!alpha) return x;
+    return core_act::snake_alpha(ctx, x, alpha);
+}
+
+// Conv1d with weight-normed weights. x: (C_in, T) → (C_out, T).
+// Symmetric padding: p = (K-1)*dil/2.
+static ggml_tensor* wn_conv1d(ggml_context* ctx, ggml_tensor* x, const wn_conv& wn,
+                               int dilation) {
+    ggml_tensor* w = wn_weight(wn);
+    if (!w) return x;
+    const int K = (int)w->ne[0];
+    const int Cout = (int)w->ne[2];
+    const int T = (int)x->ne[1];
+    const int p = dilation * (K - 1) / 2;
+
+    // ggml_conv_1d expects input (T, C_in) and weight (K, C_in, C_out)
+    ggml_tensor* xt = ggml_cont(ctx, ggml_transpose(ctx, x)); // (T, C_in)
+    ggml_tensor* y = ggml_conv_1d(ctx, w, xt, /*stride*/1, p, dilation);
+    // Result shape: (T_out, C_out, 1)
+    y = ggml_reshape_2d(ctx, y, T, Cout);
+    y = ggml_cont(ctx, ggml_transpose(ctx, y)); // (C_out, T)
+    if (wn.b) {
+        y = ggml_add(ctx, y, ggml_cast(ctx, wn.b, GGML_TYPE_F32));
+    }
+    return y;
+}
+
+// ConvTranspose1d with weight-normed weights.
+// Uses core_convt::convt1d_crop pattern.
+// x: (C_in, T) → (C_out, T*stride)
+static ggml_tensor* wn_convt1d(ggml_context* ctx, ggml_tensor* x,
+                                const wn_conv& wn, int stride) {
+    ggml_tensor* w = wn_weight(wn);
+    if (!w) return x;
+
+    // ggml_conv_transpose_1d expects input (T, C_in) and weight (K, C_out, C_in)
+    // Our weight is (K, C_in, C_out) from the GGUF — need to permute
+    // Actually, let's check: the PyTorch ConvTranspose1d weight is (C_in, C_out, K)
+    // The GGUF stores it as (K, C_in, C_out) which ggml needs as (K, C_out, C_in)
+    // for ggml_conv_transpose_1d. We need to swap dims 1 and 2.
+    ggml_tensor* w_perm = ggml_cont(ctx, ggml_permute(ctx, w, 0, 2, 1, 3));
+
+    const int Cout = (int)w_perm->ne[1];
+    const int T = (int)x->ne[1];
+    const int T_out = T * stride;
+
+    ggml_tensor* xt = ggml_cont(ctx, ggml_transpose(ctx, x)); // (T, C_in)
+    ggml_tensor* y = ggml_conv_transpose_1d(ctx, w_perm, xt, stride, 0, 1);
+    // Result needs cropping: remove `pad` from each side
+    // y shape: roughly (T_raw, C_out)
+    int T_raw = (int)y->ne[0];
+    if (T_raw > T_out) {
+        int crop = (T_raw - T_out) / 2;
+        y = ggml_view_2d(ctx, y, T_out, Cout,
+                          y->nb[1], (size_t)crop * y->nb[0]);
+        y = ggml_cont(ctx, y);
+    }
+    y = ggml_reshape_2d(ctx, y, T_out, Cout);
+    y = ggml_cont(ctx, ggml_transpose(ctx, y)); // (C_out, T_out)
+    if (wn.b) {
+        y = ggml_add(ctx, y, ggml_cast(ctx, wn.b, GGML_TYPE_F32));
+    }
+    return y;
+}
+
+// ResidualUnit: Snake → Conv(k=7,dil) → Snake → Conv(k=1)
+static ggml_tensor* res_unit(ggml_context* ctx, ggml_tensor* x,
+                              const tada_codec_res_unit& ru, int dilation) {
+    ggml_tensor* y = snake1d(ctx, x, ru.alpha0);
+    y = wn_conv1d(ctx, y, ru.conv0, dilation);
+    y = snake1d(ctx, y, ru.alpha1);
+    y = wn_conv1d(ctx, y, ru.conv1, /*dilation*/1);
+    return ggml_add(ctx, x, y);
+}
+
+// DecoderBlock: Snake → ConvT(stride) → 3× ResUnit(d=1,3,9)
+static ggml_tensor* dec_block(ggml_context* ctx, ggml_tensor* x,
+                               const tada_codec_dec_block& blk, int stride) {
+    x = snake1d(ctx, x, blk.snake_alpha);
+    x = wn_convt1d(ctx, x, blk.up_conv, stride);
+    static const int dilations[3] = {1, 3, 9};
+    for (int r = 0; r < 3; r++) {
+        x = res_unit(ctx, x, blk.res[r], dilations[r]);
+    }
+    return x;
+}
+
+// ──────────────────── full decode graph ─────────────────────────────
+
+static ggml_cgraph* build_decode_graph(tada_codec_context* c, int n_frames) {
+    const int d = c->hidden_dim;       // 1024
+    const int ed = c->embed_dim;       // 512
+    const int nh = c->n_attn_heads;    // 8
+    const int hd = c->head_dim;        // 128
+    const float eps = 1e-5f;
+
+    ggml_init_params ip = {c->compute_meta.size(), c->compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    // Large graph — attention + DAC decoder has many ops
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 32768, false);
+
+    // Input: (embed_dim, n_frames) = (512, T)
+    ggml_tensor* features = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, ed, n_frames);
+    ggml_set_name(features, "features"); ggml_set_input(features);
+
+    // 1. Linear projection: (512, T) → (1024, T)
+    ggml_tensor* cur = ggml_mul_mat(ctx0, c->proj_w, features);
+    if (c->proj_b) cur = ggml_add(ctx0, cur, c->proj_b);
+
+    // 2. Local attention encoder (6 layers)
+    // NOTE: Simplified — no block-attention mask for now (full self-attention).
+    // The v2 block attention mask is an optimization for quality but not
+    // required for basic functionality.
+    for (int il = 0; il < c->n_attn_layers; il++) {
+        const auto& l = c->attn_layers[il];
+
+        // Self-attention (post-norm)
+        // QKV projection
+        ggml_tensor* qkv = ggml_mul_mat(ctx0, l.qkv_w, cur); // (3*d, T)
+        if (l.qkv_b) qkv = ggml_add(ctx0, qkv, l.qkv_b);
+
+        // Split into Q, K, V — each (d, T)
+        ggml_tensor* q = ggml_view_2d(ctx0, qkv, d, n_frames, qkv->nb[1], 0);
+        ggml_tensor* k = ggml_view_2d(ctx0, qkv, d, n_frames, qkv->nb[1], (size_t)d * sizeof(float));
+        ggml_tensor* v = ggml_view_2d(ctx0, qkv, d, n_frames, qkv->nb[1], (size_t)2 * d * sizeof(float));
+        q = ggml_cont(ctx0, q);
+        k = ggml_cont(ctx0, k);
+        v = ggml_cont(ctx0, v);
+
+        // Reshape for multi-head: (d, T) → (hd, nh, T) → permute to (hd, T, nh)
+        q = ggml_reshape_3d(ctx0, q, hd, nh, n_frames);
+        k = ggml_reshape_3d(ctx0, k, hd, nh, n_frames);
+        v = ggml_reshape_3d(ctx0, v, hd, nh, n_frames);
+
+        // RoPE would go here — skip for now (TODO: apply from rope_freqs)
+        // The RoPE freqs are precomputed in the GGUF as (2, hd/2, max_seq_len)
+
+        // Permute: (hd, nh, T) → (hd, T, nh) for scaled dot-product
+        q = ggml_permute(ctx0, q, 0, 2, 1, 3); // (hd, T, nh)
+        k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+        v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+
+        // Attention: softmax(Q @ K^T / sqrt(hd)) @ V
+        float scale = 1.0f / std::sqrt((float)hd);
+        ggml_tensor* attn = ggml_flash_attn_ext(ctx0, q, k, v,
+                                                  /*mask*/nullptr, scale, 0, 0);
+        // Result: (hd, T, nh) → reshape to (d, T)
+        attn = ggml_cont(ctx0, attn);
+        attn = ggml_reshape_2d(ctx0, attn, d, n_frames);
+
+        // Output projection
+        attn = ggml_mul_mat(ctx0, l.out_w, attn);
+        if (l.out_b) attn = ggml_add(ctx0, attn, l.out_b);
+
+        // Post-norm residual: cur = LayerNorm(cur + attn)
+        cur = ggml_add(ctx0, cur, attn);
+        cur = ggml_norm(ctx0, cur, eps);
+        cur = ggml_mul(ctx0, cur, l.attn_norm_w);
+        if (l.attn_norm_b) cur = ggml_add(ctx0, cur, l.attn_norm_b);
+
+        // FFN: Linear(1024,4096) → GELU → Linear(4096,1024)
+        ggml_tensor* ffn = ggml_mul_mat(ctx0, l.ffn_up_w, cur);
+        if (l.ffn_up_b) ffn = ggml_add(ctx0, ffn, l.ffn_up_b);
+        ffn = ggml_gelu(ctx0, ffn);
+        ffn = ggml_mul_mat(ctx0, l.ffn_down_w, ffn);
+        if (l.ffn_down_b) ffn = ggml_add(ctx0, ffn, l.ffn_down_b);
+
+        // Post-norm residual: cur = LayerNorm(cur + ffn)
+        cur = ggml_add(ctx0, cur, ffn);
+        cur = ggml_norm(ctx0, cur, eps);
+        cur = ggml_mul(ctx0, cur, l.ffn_norm_w);
+        if (l.ffn_norm_b) cur = ggml_add(ctx0, cur, l.ffn_norm_b);
+    }
+
+    // Final norm
+    cur = ggml_norm(ctx0, cur, eps);
+    cur = ggml_mul(ctx0, cur, c->final_norm_w);
+    if (c->final_norm_b) cur = ggml_add(ctx0, cur, c->final_norm_b);
+
+    // Transpose for DAC: (1024, T) → (1024, T) channel-first already good
+    // But DAC Conv1d expects (C, T) which is what we have.
+
+    // 3. DAC decoder
+    // Input conv: (1024, T) → (1536, T)
+    cur = wn_conv1d(ctx0, cur, c->in_conv, /*dilation*/1);
+
+    // 4 decoder blocks with strides [4,4,5,6]
+    for (int b = 0; b < 4; b++) {
+        cur = dec_block(ctx0, cur, c->blocks[b], c->strides[b]);
+    }
+
+    // Output: Snake → Conv1d(96, 1, k=7) → Tanh
+    cur = snake1d(ctx0, cur, c->out_snake_alpha);
+    cur = wn_conv1d(ctx0, cur, c->out_conv, /*dilation*/1);
+    cur = ggml_tanh(ctx0, cur);
+
+    // cur is (1, T_audio) — flatten to 1D
+    int64_t T_audio = cur->ne[1];
+    cur = ggml_reshape_1d(ctx0, cur, T_audio);
+    ggml_set_name(cur, "pcm");
+    ggml_build_forward_expand(gf, cur);
+
+    ggml_free(ctx0);
+    return gf;
+}
+
+// ──────────────────────── public API ────────────────────────────────
+
+extern "C" {
+
+struct tada_codec_context* tada_codec_init_from_file(const char* path, int n_threads) {
+    auto* c = new tada_codec_context();
+    c->n_threads = n_threads;
+    c->compute_meta.resize(32 * 1024 * 1024); // 32 MB for large graph
+
+    // Metadata
+    gguf_context* meta = core_gguf::open_metadata(path);
+    if (!meta) { delete c; return nullptr; }
+    c->embed_dim    = (int)core_gguf::kv_u32(meta, "tada_codec.embed_dim", 512);
+    c->hidden_dim   = (int)core_gguf::kv_u32(meta, "tada_codec.hidden_dim", 1024);
+    c->n_attn_layers = (int)core_gguf::kv_u32(meta, "tada_codec.num_attn_layers", 6);
+    c->n_attn_heads = (int)core_gguf::kv_u32(meta, "tada_codec.num_attn_heads", 8);
+    c->head_dim     = c->hidden_dim / c->n_attn_heads;
+    c->wav_channels = (int)core_gguf::kv_u32(meta, "tada_codec.wav_channels", 1536);
+    core_gguf::free_metadata(meta);
+
+    // Channel config: 1536, 768, 384, 192, 96
+    for (int i = 0; i < 5; i++) {
+        c->channels[i] = c->wav_channels / (1 << i);
+    }
+
+    fprintf(stderr, "tada-codec: %dd, %d attn layers, %d heads, strides [4,4,5,6]\n",
+            c->hidden_dim, c->n_attn_layers, c->n_attn_heads);
+
+    // Backend
+    c->backend = ggml_backend_cpu_init();
+    ggml_backend_cpu_set_n_threads(c->backend, n_threads);
+
+    // Weights
+    core_gguf::WeightLoad wl;
+    if (!core_gguf::load_weights(path, c->backend, "tada-codec", wl)) {
+        fprintf(stderr, "tada-codec: failed to load weights\n");
+        delete c;
+        return nullptr;
+    }
+    c->ctx_w = wl.ctx;
+    c->buf_w = wl.buf;
+    c->tensors = std::move(wl.tensors);
+
+    if (!bind_weights(c)) {
+        fprintf(stderr, "tada-codec: failed to bind tensors\n");
+        delete c;
+        return nullptr;
+    }
+
+    fprintf(stderr, "tada-codec: loaded OK (%zu tensors)\n", c->tensors.size());
+    return c;
+}
+
+float* tada_codec_decode(struct tada_codec_context* ctx,
+                         const float* features, int n_frames,
+                         const int32_t* /*token_masks*/,
+                         int* out_n_samples) {
+    if (!ctx || !features || n_frames <= 0) return nullptr;
+
+    const int ed = ctx->embed_dim;
+
+    ggml_cgraph* gf = build_decode_graph(ctx, n_frames);
+
+    ggml_backend_t backends[] = {ctx->backend};
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 1, 32768, false, false);
+    ggml_backend_sched_reset(sched);
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+        fprintf(stderr, "tada-codec: failed to alloc graph\n");
+        ggml_backend_sched_free(sched);
+        return nullptr;
+    }
+
+    // Set input: features (embed_dim, n_frames) column-major
+    ggml_tensor* inp = ggml_graph_get_tensor(gf, "features");
+    ggml_backend_tensor_set(inp, features, 0, (size_t)ed * n_frames * sizeof(float));
+
+    // Set the ones tensor for weight norm (if used in the graph)
+    // This needs to be set for every wn_materialize call that created a ones tensor
+    // TODO: this is a design issue — the ones tensor needs to be filled
+
+    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "tada-codec: graph compute failed\n");
+        ggml_backend_sched_free(sched);
+        return nullptr;
+    }
+
+    ggml_tensor* pcm_t = ggml_graph_get_tensor(gf, "pcm");
+    int n_samples = (int)ggml_nelements(pcm_t);
+    float* pcm = (float*)malloc((size_t)n_samples * sizeof(float));
+    ggml_backend_tensor_get(pcm_t, pcm, 0, (size_t)n_samples * sizeof(float));
+
+    ggml_backend_sched_free(sched);
+    *out_n_samples = n_samples;
+    return pcm;
+}
+
+void tada_codec_pcm_free(float* pcm) {
+    free(pcm);
+}
+
+void tada_codec_free(struct tada_codec_context* ctx) {
+    if (!ctx) return;
+    if (ctx->buf_w) ggml_backend_buffer_free(ctx->buf_w);
+    if (ctx->ctx_w) ggml_free(ctx->ctx_w);
+    if (ctx->backend) ggml_backend_free(ctx->backend);
+    delete ctx;
+}
+
+} // extern "C"

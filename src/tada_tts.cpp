@@ -4,6 +4,7 @@
 // See tada_tts.h for the C ABI.
 
 #include "tada_tts.h"
+#include "tada_codec.h"
 #include "core/gguf_loader.h"
 #include "core/attention.h"
 #include "core/ffn.h"
@@ -141,9 +142,9 @@ struct tada_context {
     ggml_tensor*           kv_v   = nullptr;
     int kv_max_ctx = 0;
 
-    // Codec (lazy)
+    // Codec (lazy-loaded)
     std::string codec_path;
-    // TODO: codec context pointer once codec runtime is implemented
+    tada_codec_context* codec_ctx = nullptr;
 
     uint64_t rng_state = 0;
 };
@@ -855,7 +856,11 @@ struct tada_context* tada_init_from_file(const char* path_model,
 int tada_set_codec_path(struct tada_context* ctx, const char* path) {
     if (!ctx || !path) return -1;
     ctx->codec_path = path;
-    // TODO: load codec model
+    ctx->codec_ctx = tada_codec_init_from_file(path, ctx->params.n_threads);
+    if (!ctx->codec_ctx) {
+        fprintf(stderr, "tada: failed to load codec from %s\n", path);
+        return -1;
+    }
     return 0;
 }
 
@@ -1009,26 +1014,65 @@ float* tada_synthesize(struct tada_context* ctx, const char* text, int* out_n_sa
     }
 
     // ── Denormalize and expand ──
-    // features * std + mean
-    int total_frames = 0;
+    // features = features * acoustic_std + acoustic_mean
+    float ac_std = hp.acoustic_std;
+    float ac_mean = hp.acoustic_mean;
+
+    // Expand with time_before durations (same as model._decode_wav)
+    std::vector<float> expanded;
+    std::vector<int32_t> token_masks;
+    // time_before[0] gives leading zeros, then feature[0], etc.
+    std::vector<int> all_times;
+    all_times.push_back(0); // first position has no leading silence
+    for (int t : time_before_list) all_times.push_back(t);
+
     for (size_t i = 0; i < acoustic_features.size(); i++) {
-        int t = (i == 0) ? 0 : time_before_list[i - 1];
-        total_frames += std::max(0, t - 1) + 1;
+        // Insert (time - 1) zero frames before this feature
+        int n_zeros = std::max(0, all_times[i] - 1);
+        for (int z = 0; z < n_zeros; z++) {
+            for (int d = 0; d < ad; d++) expanded.push_back(0.0f);
+            token_masks.push_back(0);
+        }
+        // Insert the feature (denormalized)
+        for (int d = 0; d < ad; d++) {
+            expanded.push_back(acoustic_features[i][d] * ac_std + ac_mean);
+        }
+        token_masks.push_back(1);
     }
-    // Add trailing frames from last time value
+    // Trailing zeros from last time value
     if (!time_before_list.empty()) {
-        total_frames += time_before_list.back();
+        int trail = time_before_list.back();
+        for (int z = 0; z < trail; z++) {
+            for (int d = 0; d < ad; d++) expanded.push_back(0.0f);
+            token_masks.push_back(0);
+        }
     }
 
-    // TODO: Run codec decoder on expanded features
-    // For now, return empty audio as placeholder
-    fprintf(stderr, "tada: codec decoder not yet implemented. "
-            "%zu features, %d expanded frames\n",
-            acoustic_features.size(), total_frames);
+    int n_expanded = (int)(expanded.size() / ad);
 
-    // Return silence placeholder
-    int n_samples = total_frames * 480;  // 480 = upsample factor (4*4*5*6)
-    if (n_samples <= 0) n_samples = 24000;  // 1 second of silence
+    if (ctx->params.verbosity >= 1) {
+        fprintf(stderr, "tada: %zu features → %d expanded frames\n",
+                acoustic_features.size(), n_expanded);
+    }
+
+    // ── Codec decode ──
+    if (ctx->codec_ctx && n_expanded > 0) {
+        int n_samples = 0;
+        float* pcm = tada_codec_decode(ctx->codec_ctx, expanded.data(),
+                                        n_expanded, token_masks.data(),
+                                        &n_samples);
+        if (pcm && n_samples > 0) {
+            *out_n_samples = n_samples;
+            return pcm;
+        }
+        fprintf(stderr, "tada: codec decode failed, returning silence\n");
+    } else if (!ctx->codec_ctx) {
+        fprintf(stderr, "tada: no codec loaded — returning silence\n");
+    }
+
+    // Fallback: silence
+    int n_samples = n_expanded * 480;
+    if (n_samples <= 0) n_samples = 24000;
     float* pcm = (float*)calloc(n_samples, sizeof(float));
     *out_n_samples = n_samples;
     return pcm;
@@ -1040,6 +1084,7 @@ void tada_pcm_free(float* pcm) {
 
 void tada_free(struct tada_context* ctx) {
     if (!ctx) return;
+    if (ctx->codec_ctx) tada_codec_free(ctx->codec_ctx);
     if (ctx->sched) ggml_backend_sched_free(ctx->sched);
     if (ctx->kv_buf) ggml_backend_buffer_free(ctx->kv_buf);
     if (ctx->kv_ctx) ggml_free(ctx->kv_ctx);
