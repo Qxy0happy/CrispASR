@@ -522,10 +522,11 @@ static void lts_fallback(const std::string& word, const std::map<std::string, in
 }
 
 static void g2p_english(const melotts_g2p& g2p, const std::string& text, std::vector<int>& phone_ids,
-                        std::vector<int>& tone_ids, std::vector<int>& lang_ids) {
+                        std::vector<int>& tone_ids, std::vector<int>& lang_ids, std::vector<int>& word2ph) {
     phone_ids.clear();
     tone_ids.clear();
     lang_ids.clear();
+    word2ph.clear();
 
     // Language ID for English = 2 (ZH=0, JP=1, EN=2)
     int lang_id = 2;
@@ -545,35 +546,40 @@ static void g2p_english(const melotts_g2p& g2p, const std::string& text, std::ve
 
     // Leading pad
     add_phone("_", 0);
+    word2ph.push_back(1); // pad token
 
     for (const auto& word : words) {
+        int n_before = (int)phone_ids.size();
+
         // Check if it's punctuation
         if (word.size() == 1 && g2p.symbol_to_id.count(word)) {
             add_phone(word, 0);
-            continue;
+        }
+        // Lookup in CMU dict
+        else {
+            std::string upper_word = to_upper(word);
+            auto dict_it = g2p.cmudict.find(upper_word);
+            if (dict_it != g2p.cmudict.end()) {
+                for (const auto& syllable : dict_it->second) {
+                    for (const auto& ph : syllable) {
+                        int tone = arpa_to_tone(ph);
+                        std::string base = to_lower(arpa_strip_stress(ph));
+                        std::string mapped = post_replace_ph(base, g2p.symbol_to_id);
+                        add_phone(mapped, tone);
+                    }
+                }
+            } else {
+                lts_fallback(word, g2p.symbol_to_id, tone_start, lang_id, phone_ids, tone_ids, lang_ids);
+            }
         }
 
-        // Lookup in CMU dict
-        std::string upper_word = to_upper(word);
-        auto dict_it = g2p.cmudict.find(upper_word);
-        if (dict_it != g2p.cmudict.end()) {
-            for (const auto& syllable : dict_it->second) {
-                for (const auto& ph : syllable) {
-                    int tone = arpa_to_tone(ph);
-                    std::string base = to_lower(arpa_strip_stress(ph));
-                    std::string mapped = post_replace_ph(base, g2p.symbol_to_id);
-                    add_phone(mapped, tone);
-                }
-            }
-        } else {
-            // Rule-based letter-to-phoneme fallback for OOV words.
-            // Produces approximate ARPAbet that's good enough for TTS.
-            lts_fallback(word, g2p.symbol_to_id, tone_start, lang_id, phone_ids, tone_ids, lang_ids);
-        }
+        int n_phones = (int)phone_ids.size() - n_before;
+        word2ph.push_back(n_phones);
     }
 
     // Trailing pad
     add_phone("_", 0);
+    word2ph.push_back(1);
 
     // Intersperse with blanks: [0, e0, 0, e1, 0, ..., eN, 0]
     // Matches Python: result = [item] * (len*2+1); result[1::2] = lst
@@ -591,6 +597,12 @@ static void g2p_english(const melotts_g2p& g2p, const std::string& text, std::ve
         phone_ids = p2;
         tone_ids = t2;
         lang_ids = l2;
+
+        // Double word2ph to account for interspersed blanks
+        for (auto& w : word2ph)
+            w *= 2;
+        if (!word2ph.empty())
+            word2ph[0] += 1; // leading pad gets +1
     }
 }
 
@@ -2431,7 +2443,8 @@ int melotts_synthesize(struct melotts_context* ctx, const char* text, float** pc
 
     // 1. Text processing (G2P)
     std::vector<int> phone_ids, tone_ids, lang_ids;
-    g2p_english(ctx->g2p, text, phone_ids, tone_ids, lang_ids);
+    std::vector<int> word2ph;
+    g2p_english(ctx->g2p, text, phone_ids, tone_ids, lang_ids, word2ph);
     int T = (int)phone_ids.size();
 
     if (ctx->verbosity >= 2) {
@@ -2468,25 +2481,27 @@ int melotts_synthesize(struct melotts_context* ctx, const char* text, float** pc
         if (bert_encoder_forward(ctx->bert_ctx, text, &bert_out, &n_bert_tokens)) {
             int bert_dim = bert_encoder_hidden_size(ctx->bert_ctx);
             // bert_out is (n_bert_tokens, bert_dim) row-major
-            // We need (bert_dim, T) where T is the phone sequence length
-            // Simple word2ph approximation: distribute BERT tokens evenly
-            // across phonemes (excluding interspersed blanks)
-            // n_bert_tokens includes [CLS] and [SEP]
-            int n_content_tokens = n_bert_tokens - 2; // exclude [CLS] [SEP]
-            if (n_content_tokens > 0) {
-                ja_bert_features.resize(bert_dim * T, 0.0f);
-                // Map each phone position to a BERT token
-                // Blanks (even positions after intersperse) get the nearest token
-                for (int t = 0; t < T; t++) {
-                    // Position in the original phone sequence (before intersperse)
-                    // Odd positions are real phones, even are blanks
-                    int phone_pos = t / 2; // approximate
-                    // Map phone_pos to BERT token (skip [CLS])
-                    int bert_tok = 1 + (phone_pos * n_content_tokens) / std::max(1, (T + 1) / 2);
-                    bert_tok = std::clamp(bert_tok, 1, n_bert_tokens - 2);
+            // Expand to (bert_dim, T) using word2ph mapping:
+            // Each word2ph[i] phones get repeated BERT features from token i
+            ja_bert_features.resize(bert_dim * T, 0.0f);
+            int phone_pos = 0;
+            int bert_tok = 0;
+            for (int wi = 0; wi < (int)word2ph.size() && phone_pos < T; wi++) {
+                int n_phones = word2ph[wi];
+                int bt = std::clamp(bert_tok, 0, n_bert_tokens - 1);
+                for (int p = 0; p < n_phones && phone_pos < T; p++) {
                     for (int c = 0; c < bert_dim; c++)
-                        ja_bert_features[c * T + t] = bert_out[bert_tok * bert_dim + c];
+                        ja_bert_features[c * T + phone_pos] = bert_out[bt * bert_dim + c];
+                    phone_pos++;
                 }
+                bert_tok++;
+            }
+            // Fill remaining with last token
+            while (phone_pos < T) {
+                int bt = std::clamp(n_bert_tokens - 1, 0, n_bert_tokens - 1);
+                for (int c = 0; c < bert_dim; c++)
+                    ja_bert_features[c * T + phone_pos] = bert_out[bt * bert_dim + c];
+                phone_pos++;
             }
             free(bert_out);
             if (ctx->verbosity >= 2)

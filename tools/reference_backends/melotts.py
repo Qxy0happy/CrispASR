@@ -119,10 +119,19 @@ def main():
     T = len(phone_ids)
     print(f"Sequence length (with blanks): {T}")
 
-    # ── Prepare inputs ──
-    # disable-bert mode: zero BERT embeddings
-    bert = torch.zeros(1024, T)
-    ja_bert = torch.zeros(768, T)
+    # ── BERT features ──
+    # For English: ja_bert(768) carries BERT features, bert(1024) is zeros
+    from melo.text import get_bert
+
+    bert_features = get_bert(norm_text, word2ph, args.language, "cpu")
+    print(f"BERT features: {bert_features.shape}")
+
+    if args.language in ["EN", "ZH_MIX_EN", "JP", "KR", "SP", "ES", "FR"]:
+        ja_bert = bert_features
+        bert = torch.zeros(1024, T)
+    else:
+        bert = bert_features
+        ja_bert = torch.zeros(768, T)
 
     x = torch.LongTensor(phone_ids).unsqueeze(0)
     t_tone = torch.LongTensor(tone_ids).unsqueeze(0)
@@ -142,6 +151,7 @@ def main():
     stages["phoneme_ids"] = np.array(phone_ids, dtype=np.int32)
     stages["tone_ids"] = np.array(tone_ids, dtype=np.int32)
     stages["lang_ids"] = np.array(lang_ids, dtype=np.int32)
+    stages["ja_bert_features"] = ja_bert.cpu().numpy().astype(np.float32)
 
     with torch.no_grad():
         # 1. Speaker embedding
