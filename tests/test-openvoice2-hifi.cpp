@@ -20,6 +20,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Failed to load model\n");
         return 1;
     }
+    const char* dump_dir = getenv("OV2_DUMP_DIR");
+    if (dump_dir) openvoice2_set_dump_dir(ctx, dump_dir);
 
     // Test: convert JFK audio with itself as reference (identity test)
     // Read JFK WAV

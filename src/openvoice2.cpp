@@ -795,6 +795,14 @@ static void enc_q_forward(openvoice2_context* ctx, const std::vector<float>& spe
     int inter = hp.inter_channels;
     int spec_ch = hp.spec_channels;
 
+    // Transpose spec from (T, spec_ch) to (spec_ch, T) to match PyTorch Conv1d layout.
+    // PyTorch spectrogram_torch returns (1, 513, T) — channels-first.
+    // Our STFT stores as (T, 513) — need to transpose for the k=1 conv.
+    std::vector<float> spec_ct(spec_ch * T);
+    for (int t = 0; t < T; t++)
+        for (int c = 0; c < spec_ch; c++)
+            spec_ct[c * T + t] = spec[t * spec_ch + c];
+
     // Pre conv: (spec_channels, T) → (hidden, T), k=1
     std::vector<float> w_pre, b_pre;
     read_f32(eq.pre_w, w_pre);
@@ -805,10 +813,12 @@ static void enc_q_forward(openvoice2_context* ctx, const std::vector<float>& spe
         for (int oc = 0; oc < hidden; oc++) {
             float sum = b_pre[oc];
             for (int ic = 0; ic < spec_ch; ic++)
-                sum += spec[t * spec_ch + ic] * w_pre[ic + oc * spec_ch];
+                sum += spec_ct[ic * T + t] * w_pre[ic + oc * spec_ch];
             h[t * hidden + oc] = sum;
         }
     }
+
+    dump_stage(ctx, "enc_q_pre", h.data(), h.size());
 
     // Compute speaker conditioning for WaveNet
     std::vector<float> g_cond;
@@ -822,6 +832,8 @@ static void enc_q_forward(openvoice2_context* ctx, const std::vector<float>& spe
     // WaveNet
     std::vector<float> wn_out;
     wavenet_forward(eq.wn, hp.n_wn_layers_enc_q, hidden, T, h, g_cond, wn_out);
+
+    dump_stage(ctx, "enc_q_wn_out", wn_out.data(), wn_out.size());
 
     // Proj: (hidden, T) → (2*inter, T), k=1
     std::vector<float> w_proj, b_proj;
@@ -1062,7 +1074,13 @@ static bool hifigan_decode_cpu(openvoice2_context* ctx, const std::vector<float>
         return false;
     }
 
-    ggml_backend_tensor_set(x_input, z.data(), 0, z.size() * sizeof(float));
+    // z is in (T, C) row-major layout but the ggml tensor is (C, T) channels-first.
+    // Transpose before setting.
+    std::vector<float> z_ct(z.size());
+    for (int t = 0; t < T_latent; t++)
+        for (int c = 0; c < C_in; c++)
+            z_ct[c * T_latent + t] = z[t * C_in + c];
+    ggml_backend_tensor_set(x_input, z_ct.data(), 0, z_ct.size() * sizeof(float));
     if (g_input && !g_vec.empty())
         ggml_backend_tensor_set(g_input, g_vec.data(), 0, gin * sizeof(float));
 
@@ -1152,7 +1170,9 @@ extern "C" bool openvoice2_convert(struct openvoice2_context* ctx, const float* 
     // 3. Posterior encoder: src_spec → z (with g=0 for zero_g)
     std::vector<float> g_zero(hp.gin_channels, 0.0f);
     std::vector<float> z;
+    dump_stage(ctx, "src_spec", src_spec.data(), src_spec.size());
     enc_q_forward(ctx, src_spec, T_src, g_zero, z);
+    dump_stage(ctx, "enc_q_z", z.data(), z.size());
 
     if (ctx->verbosity >= 1) {
         fprintf(stderr, "openvoice2: enc_q → z (%d × %d)\n", hp.inter_channels, T_src);
@@ -1160,10 +1180,8 @@ extern "C" bool openvoice2_convert(struct openvoice2_context* ctx, const float* 
     }
 
     // 4. Source speaker embedding — use pre-saved base speaker if available
-    //    (upstream OpenVoice2 uses base_speakers/ses/en-default.pth, not ref_enc).
     std::vector<float> src_se;
     if (!ctx->w.base_speakers.empty()) {
-        // Default to first base speaker (en-au alphabetically, or en-default if present)
         const ov2_base_speaker* best = &ctx->w.base_speakers[0];
         for (const auto& bs : ctx->w.base_speakers) {
             if (bs.name == "en-default") {
@@ -1175,14 +1193,16 @@ extern "C" bool openvoice2_convert(struct openvoice2_context* ctx, const float* 
         if (ctx->verbosity >= 1)
             fprintf(stderr, "openvoice2: using base speaker '%s' as source SE\n", best->name.c_str());
     } else {
-        // Fallback: extract from source audio (less accurate for synthetic input)
         ref_enc_forward(ctx, src_spec, T_src, src_se);
         if (ctx->verbosity >= 1)
             fprintf(stderr, "openvoice2: extracted source SE from audio (no base speakers in GGUF)\n");
     }
+    dump_stage(ctx, "src_se", src_se.data(), src_se.size());
+    dump_stage(ctx, "target_se", target_se.data(), target_se.size());
 
     // 5. Flow forward: z → z_p (normalize with source voice)
     flow_wavenet(ctx, z, T_src, src_se, /*reverse=*/false);
+    dump_stage(ctx, "z_after_flow_fwd", z.data(), z.size());
 
     if (ctx->verbosity >= 1) {
         fprintf(stderr, "openvoice2: flow forward (source → prior)\n");
@@ -1191,6 +1211,7 @@ extern "C" bool openvoice2_convert(struct openvoice2_context* ctx, const float* 
 
     // 6. Flow reverse: z_p → z_hat (denormalize with target voice)
     flow_wavenet(ctx, z, T_src, target_se, /*reverse=*/true);
+    dump_stage(ctx, "z_after_flow_rev", z.data(), z.size());
 
     if (ctx->verbosity >= 1) {
         fprintf(stderr, "openvoice2: flow reverse (prior → target)\n");
@@ -1203,6 +1224,7 @@ extern "C" bool openvoice2_convert(struct openvoice2_context* ctx, const float* 
         fprintf(stderr, "openvoice2: hifigan decode failed\n");
         return false;
     }
+    dump_stage(ctx, "dec_output", pcm.data(), pcm.size());
 
     *n_out = (int)pcm.size();
     *out_pcm = (float*)malloc(pcm.size() * sizeof(float));

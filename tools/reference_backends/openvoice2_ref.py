@@ -195,28 +195,38 @@ def main():
     dump("enc_q_z", z)
     print(f"  z: {z.shape} mean={z.mean():.6f} std={z.std():.6f}")
 
-    # ── source speaker embedding ──
-    print("\n=== src speaker embedding ===")
-    x_src_ref = src_spec.transpose(1, 2).unsqueeze(1)
-    # LayerNorm
-    mean_s = src_spec.transpose(1, 2).mean(-1, keepdim=True)
-    var_s = src_spec.transpose(1, 2).var(-1, unbiased=False, keepdim=True)
-    x_s = (src_spec.transpose(1, 2) - mean_s) / torch.sqrt(var_s + 1e-5) * ln_w + ln_b
-    x_s = x_s.unsqueeze(1)
-    for i in range(6):
-        w = fuse_wn(sd, f"ref_enc.convs.{i}")
-        b = sd[f"ref_enc.convs.{i}.bias"]
-        x_s = F.conv2d(x_s, w, b, stride=2, padding=1)
-        x_s = F.relu(x_s)
-    C2, H2, W2 = x_s.shape[1], x_s.shape[2], x_s.shape[3]
-    x_s_gru = x_s.squeeze(0).permute(1, 0, 2).reshape(H2, C2*W2).unsqueeze(0)
-    gru2 = torch.nn.GRU(C2*W2, 128, batch_first=True)
-    gru2.weight_ih_l0.data = sd["ref_enc.gru.weight_ih_l0"]
-    gru2.weight_hh_l0.data = sd["ref_enc.gru.weight_hh_l0"]
-    gru2.bias_ih_l0.data = sd["ref_enc.gru.bias_ih_l0"]
-    gru2.bias_hh_l0.data = sd["ref_enc.gru.bias_hh_l0"]
-    _, h_s = gru2(x_s_gru)
-    src_se = F.linear(h_s.squeeze(0), proj_w, proj_b)
+    # ── source speaker embedding (pre-saved, matching upstream demo) ──
+    print("\n=== src speaker embedding (pre-saved en-default) ===")
+    import os
+    base_se_path = os.path.join(os.path.dirname(sys.argv[1]), "..", "base_speakers", "ses", "en-default.pth")
+    if os.path.exists(base_se_path):
+        src_se = torch.load(base_se_path, map_location="cpu", weights_only=False)
+        src_se = src_se.squeeze()  # (256,) or (1,256,1) → (256,)
+        if src_se.ndim == 1:
+            src_se = src_se.unsqueeze(0)  # (1, 256)
+        print(f"  loaded pre-saved SE from {base_se_path}: {src_se.shape}")
+    else:
+        # Fallback: extract from source audio via ref_enc
+        print(f"  WARNING: no pre-saved SE at {base_se_path}, extracting from source audio")
+        x_s = src_spec.transpose(1, 2)
+        mean_s = x_s.mean(-1, keepdim=True)
+        var_s = x_s.var(-1, unbiased=False, keepdim=True)
+        x_s = (x_s - mean_s) / torch.sqrt(var_s + 1e-5) * ln_w + ln_b
+        x_s = x_s.unsqueeze(1)
+        for i in range(6):
+            w = fuse_wn(sd, f"ref_enc.convs.{i}")
+            b = sd[f"ref_enc.convs.{i}.bias"]
+            x_s = F.conv2d(x_s, w, b, stride=2, padding=1)
+            x_s = F.relu(x_s)
+        C2, H2, W2 = x_s.shape[1], x_s.shape[2], x_s.shape[3]
+        x_s_gru = x_s.squeeze(0).permute(1, 0, 2).reshape(H2, C2*W2).unsqueeze(0)
+        gru2 = torch.nn.GRU(C2*W2, 128, batch_first=True)
+        gru2.weight_ih_l0.data = sd["ref_enc.gru.weight_ih_l0"]
+        gru2.weight_hh_l0.data = sd["ref_enc.gru.weight_hh_l0"]
+        gru2.bias_ih_l0.data = sd["ref_enc.gru.bias_ih_l0"]
+        gru2.bias_hh_l0.data = sd["ref_enc.gru.bias_hh_l0"]
+        _, h_s = gru2(x_s_gru)
+        src_se = F.linear(h_s.squeeze(0), proj_w, proj_b)
     dump("src_se", src_se)
     print(f"  src_se: mean={src_se.mean():.6f}")
 
