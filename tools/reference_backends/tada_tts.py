@@ -28,6 +28,10 @@ import numpy as np
 
 DEFAULT_STAGES = [
     "text_tokens",
+    "prompt_token_values",
+    "prompt_token_positions",
+    "prompt_time_before",
+    "prompt_time_after",
     "acoustic_features",
     "time_before",
     "codec_pcm",
@@ -116,6 +120,12 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
 
     print(f"  prompt: {prompt.token_values.shape[1]} aligned tokens")
 
+    # ── Dump prompt features for C++ to use as pre-computed input ──
+    if "prompt_token_values" in stages:
+        out["prompt_token_values"] = prompt.token_values[0].cpu().float().numpy()
+    if "prompt_token_positions" in stages:
+        out["prompt_token_positions"] = prompt.token_positions[0].cpu().float().numpy()
+
     # ── Tokenize synth text ──
     text_tokens_raw = tokenizer.encode(syn_text, add_special_tokens=False)
     if "text_tokens" in stages:
@@ -143,6 +153,11 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
         )
 
     # ── Extract intermediates ──
+    if gen_output.input_text_ids is not None:
+        print(f"  input_ids: {gen_output.input_text_ids.shape}")
+        if "input_ids" in stages:
+            out["input_ids"] = gen_output.input_text_ids[0].cpu().float().numpy()
+
     if gen_output.acoustic_features is not None and "acoustic_features" in stages:
         af = gen_output.acoustic_features[0].cpu().float().numpy()
         out["acoustic_features"] = af
