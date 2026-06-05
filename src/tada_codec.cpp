@@ -395,6 +395,11 @@ static ggml_cgraph* build_decode_graph(tada_codec_context* c, int n_frames) {
     ggml_tensor* cur = ggml_mul_mat(ctx0, c->proj_w, features);
     if (c->proj_b) cur = ggml_add(ctx0, cur, c->proj_b);
 
+    // Dump: codec_proj
+    ggml_tensor* dump_proj = ggml_cont(ctx0, cur);
+    ggml_set_name(dump_proj, "dump_proj");
+    ggml_build_forward_expand(gf, dump_proj);
+
     // 2. Local attention encoder (6 layers)
     // NOTE: Simplified — no block-attention mask for now (full self-attention).
     // The v2 block attention mask is an optimization for quality but not
@@ -473,8 +478,10 @@ static ggml_cgraph* build_decode_graph(tada_codec_context* c, int n_frames) {
     cur = ggml_mul(ctx0, cur, c->final_norm_w);
     if (c->final_norm_b) cur = ggml_add(ctx0, cur, c->final_norm_b);
 
-    // Transpose for DAC: (1024, T) → (1024, T) channel-first already good
-    // But DAC Conv1d expects (C, T) which is what we have.
+    // Dump: codec_attn_out
+    ggml_tensor* dump_attn = ggml_cont(ctx0, cur);
+    ggml_set_name(dump_attn, "dump_attn");
+    ggml_build_forward_expand(gf, dump_attn);
 
     // 3. DAC decoder
     // Input conv: (1024, T) → (1536, T)
@@ -587,18 +594,47 @@ float* tada_codec_decode(struct tada_codec_context* ctx,
         ggml_backend_tensor_set(pos_t, positions.data(), 0,
                                  (size_t)n_frames * sizeof(int32_t));
     }
-    // TODO: this is a design issue — the ones tensor needs to be filled
-
     if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "tada-codec: graph compute failed\n");
         ggml_backend_sched_free(sched);
         return nullptr;
     }
 
+    // Dump intermediate tensors for diff comparison
+    auto dump = [&](const char* name) {
+        ggml_tensor* t = ggml_graph_get_tensor(gf, name);
+        if (!t) return;
+        int n = (int)ggml_nelements(t);
+        std::vector<float> buf(n);
+        ggml_backend_tensor_get(t, buf.data(), 0, (size_t)n * sizeof(float));
+        float rms = 0;
+        for (int i = 0; i < n; i++) rms += buf[i] * buf[i];
+        rms = std::sqrt(rms / n);
+        float mn = *std::min_element(buf.begin(), buf.end());
+        float mx = *std::max_element(buf.begin(), buf.end());
+        fprintf(stderr, "  DUMP %s: n=%d range=[%.4f, %.4f] rms=%.4f\n",
+                name, n, mn, mx, rms);
+    };
+    dump("dump_proj");
+    dump("dump_attn");
+
     ggml_tensor* pcm_t = ggml_graph_get_tensor(gf, "pcm");
     int n_samples = (int)ggml_nelements(pcm_t);
     float* pcm = (float*)malloc((size_t)n_samples * sizeof(float));
     ggml_backend_tensor_get(pcm_t, pcm, 0, (size_t)n_samples * sizeof(float));
+
+    // Dump PCM stats
+    {
+        float rms = 0, mn = pcm[0], mx = pcm[0];
+        for (int i = 0; i < n_samples; i++) {
+            rms += pcm[i] * pcm[i];
+            if (pcm[i] < mn) mn = pcm[i];
+            if (pcm[i] > mx) mx = pcm[i];
+        }
+        rms = std::sqrt(rms / n_samples);
+        fprintf(stderr, "  DUMP pcm: n=%d range=[%.6f, %.6f] rms=%.6f\n",
+                n_samples, mn, mx, rms);
+    }
 
     ggml_backend_sched_free(sched);
     *out_n_samples = n_samples;
