@@ -68,13 +68,16 @@ struct tada_codec_attn_layer {
 
 struct tada_codec_res_unit {
     ggml_tensor* alpha0;       // Snake1d alpha
+    ggml_tensor* inv_alpha0;   // 1/alpha0 (precomputed)
     wn_conv conv0;             // WNConv1d k=7
     ggml_tensor* alpha1;       // Snake1d alpha
+    ggml_tensor* inv_alpha1;   // 1/alpha1 (precomputed)
     wn_conv conv1;             // WNConv1d k=1
 };
 
 struct tada_codec_dec_block {
     ggml_tensor* snake_alpha;  // Snake1d alpha
+    ggml_tensor* inv_snake_alpha; // 1/alpha (precomputed)
     wn_conv up_conv;           // WNConvTranspose1d
     tada_codec_res_unit res[3]; // dilation 1, 3, 9
 };
@@ -97,6 +100,7 @@ struct tada_codec_context {
     wn_conv in_conv;                    // Conv1d(1024, 1536, k=7)
     tada_codec_dec_block blocks[4];     // strides [4,4,5,6]
     ggml_tensor* out_snake_alpha = nullptr;
+    ggml_tensor* out_inv_snake_alpha = nullptr;
     wn_conv out_conv;                   // Conv1d(96, 1, k=7)
 
     // Config
@@ -201,6 +205,58 @@ static bool bind_weights(tada_codec_context* c) {
 
 // ──────────────────── graph building helpers ────────────────────────
 
+// Collect all alpha tensors that need inv_alpha, create the tensors
+// in inv_ctx, alloc buffer, then fill with 1/alpha data.
+static void precompute_all_inv_alphas(tada_codec_context* c) {
+    // Count how many inv_alpha tensors we need
+    struct alpha_pair { ggml_tensor* src; ggml_tensor** dst; };
+    std::vector<alpha_pair> pairs;
+
+    for (int b = 0; b < 4; b++) {
+        auto& blk = c->blocks[b];
+        if (blk.snake_alpha) pairs.push_back({blk.snake_alpha, &blk.inv_snake_alpha});
+        for (int r = 0; r < 3; r++) {
+            if (blk.res[r].alpha0) pairs.push_back({blk.res[r].alpha0, &blk.res[r].inv_alpha0});
+            if (blk.res[r].alpha1) pairs.push_back({blk.res[r].alpha1, &blk.res[r].inv_alpha1});
+        }
+    }
+    if (c->out_snake_alpha) pairs.push_back({c->out_snake_alpha, &c->out_inv_snake_alpha});
+
+    if (pairs.empty()) return;
+
+    // Create ggml context for inv_alpha tensors — use no_alloc=true
+    // and backend_alloc_ctx_tensors to avoid inline data allocation issues.
+    size_t ctx_size = ggml_tensor_overhead() * (pairs.size() + 4) + 4096;
+    ggml_init_params ip = {ctx_size, nullptr, true};
+    ggml_context* inv_ctx = ggml_init(ip);
+
+    for (auto& p : pairs) {
+        *p.dst = ggml_new_tensor(inv_ctx, GGML_TYPE_F32, ggml_n_dims(p.src), p.src->ne);
+    }
+
+    // Allocate buffer on backend
+    ggml_backend_buffer_t inv_buf = ggml_backend_alloc_ctx_tensors(inv_ctx, c->backend);
+
+    // Fill each with 1/alpha
+    for (auto& p : pairs) {
+        int64_t n = ggml_nelements(p.src);
+        std::vector<float> a(n), inv(n);
+        if (p.src->type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> tmp(n);
+            ggml_backend_tensor_get(p.src, tmp.data(), 0, n * sizeof(ggml_fp16_t));
+            for (int64_t i = 0; i < n; i++) a[i] = ggml_fp16_to_fp32(tmp[i]);
+        } else {
+            ggml_backend_tensor_get(p.src, a.data(), 0, n * sizeof(float));
+        }
+        for (int64_t i = 0; i < n; i++) inv[i] = 1.0f / (a[i] + 1e-12f);
+        ggml_backend_tensor_set(*p.dst, inv.data(), 0, n * sizeof(float));
+    }
+
+    // Store ctx and buf for cleanup (leak for now — small, lives for process lifetime)
+    (void)inv_buf;
+    (void)inv_ctx;
+}
+
 // Get the effective weight for a weight-normed conv.
 // For now, use v (direction) directly — the magnitude normalization
 // is approximate but produces audio. TODO: pre-materialize w = g*v/||v||
@@ -210,10 +266,36 @@ static inline ggml_tensor* wn_weight(const wn_conv& wn) {
 }
 
 // Snake1d: y = x + sin²(alpha * x) / alpha
-// Delegates to the battle-tested core_act::snake_alpha helper.
-static ggml_tensor* snake1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* alpha) {
-    if (!alpha) return x;
-    return core_act::snake_alpha(ctx, x, alpha);
+// Rewritten using cos double-angle identity to avoid ggml's fused
+// aa_snake_beta pattern match. sin²(u) = (1 - cos(2u))/2, so:
+// sin²(α·x)/α = (1 - cos(2·α·x)) / (2·α)
+static ggml_tensor* snake1d(ggml_context* ctx, ggml_tensor* x,
+                             ggml_tensor* alpha, ggml_tensor* inv_alpha) {
+    if (!alpha || !inv_alpha) return x;
+    const int C = (int)x->ne[0];
+
+    // Reshape alpha and inv_alpha to (C, 1) for broadcasting over (C, T)
+    ggml_tensor* a = ggml_cast(ctx, ggml_cont(ctx, ggml_reshape_2d(ctx, alpha, C, 1)), GGML_TYPE_F32);
+    ggml_tensor* ia = ggml_cast(ctx, ggml_cont(ctx, ggml_reshape_2d(ctx, inv_alpha, C, 1)), GGML_TYPE_F32);
+
+    // two_ax = 2 * alpha * x,  shape (C, T)
+    ggml_tensor* two_ax = ggml_scale(ctx, ggml_mul(ctx, x, a), 2.0f);
+
+    // cos_2ax = cos(2*alpha*x),  shape (C, T)
+    ggml_tensor* cos_2ax = ggml_cos(ctx, two_ax);
+
+    // neg_cos = -cos(2ax) * (inv_alpha/2),  shape (C, T)
+    // This is -cos(2ax)/(2*alpha). We use ggml_mul to broadcast ia (C,1) over (C,T).
+    ggml_tensor* half_ia = ggml_scale(ctx, ia, 0.5f);   // (C, 1)
+    ggml_tensor* neg_term = ggml_mul(ctx, cos_2ax, half_ia); // (C, T) — the cos*half_ia part
+
+    // pos_term = inv_alpha/2 broadcast to (C, T) — use ggml_repeat
+    ggml_tensor* pos_term = ggml_repeat(ctx, half_ia, cos_2ax); // (C, 1) → (C, T)
+
+    // term = 1/(2*alpha) - cos(2ax)/(2*alpha) = (1 - cos(2ax)) / (2*alpha) = sin²(ax)/alpha
+    ggml_tensor* term = ggml_sub(ctx, pos_term, neg_term);
+
+    return ggml_add(ctx, x, term);
 }
 
 // Conv1d with weight-normed weights. x: (C_in, T) → (C_out, T).
@@ -247,19 +329,14 @@ static ggml_tensor* wn_convt1d(ggml_context* ctx, ggml_tensor* x,
     ggml_tensor* w = wn_weight(wn);
     if (!w) return x;
 
-    // ggml_conv_transpose_1d expects input (T, C_in) and weight (K, C_out, C_in)
-    // Our weight is (K, C_in, C_out) from the GGUF — need to permute
-    // Actually, let's check: the PyTorch ConvTranspose1d weight is (C_in, C_out, K)
-    // The GGUF stores it as (K, C_in, C_out) which ggml needs as (K, C_out, C_in)
-    // for ggml_conv_transpose_1d. We need to swap dims 1 and 2.
-    ggml_tensor* w_perm = ggml_cont(ctx, ggml_permute(ctx, w, 0, 2, 1, 3));
-
-    const int Cout = (int)w_perm->ne[1];
+    // ggml_conv_transpose_1d expects a = (K, C_out, C_in), b = (T, C_in)
+    // GGUF stores weight as (K, C_out, C_in) — already correct, no permute needed.
+    const int Cout = (int)w->ne[1];
     const int T = (int)x->ne[1];
     const int T_out = T * stride;
 
     ggml_tensor* xt = ggml_cont(ctx, ggml_transpose(ctx, x)); // (T, C_in)
-    ggml_tensor* y = ggml_conv_transpose_1d(ctx, w_perm, xt, stride, 0, 1);
+    ggml_tensor* y = ggml_conv_transpose_1d(ctx, w, xt, stride, 0, 1);
     // Result needs cropping: remove `pad` from each side
     // y shape: roughly (T_raw, C_out)
     int T_raw = (int)y->ne[0];
@@ -280,9 +357,9 @@ static ggml_tensor* wn_convt1d(ggml_context* ctx, ggml_tensor* x,
 // ResidualUnit: Snake → Conv(k=7,dil) → Snake → Conv(k=1)
 static ggml_tensor* res_unit(ggml_context* ctx, ggml_tensor* x,
                               const tada_codec_res_unit& ru, int dilation) {
-    ggml_tensor* y = snake1d(ctx, x, ru.alpha0);
+    ggml_tensor* y = snake1d(ctx, x, ru.alpha0, ru.inv_alpha0);
     y = wn_conv1d(ctx, y, ru.conv0, dilation);
-    y = snake1d(ctx, y, ru.alpha1);
+    y = snake1d(ctx, y, ru.alpha1, ru.inv_alpha1);
     y = wn_conv1d(ctx, y, ru.conv1, /*dilation*/1);
     return ggml_add(ctx, x, y);
 }
@@ -290,7 +367,7 @@ static ggml_tensor* res_unit(ggml_context* ctx, ggml_tensor* x,
 // DecoderBlock: Snake → ConvT(stride) → 3× ResUnit(d=1,3,9)
 static ggml_tensor* dec_block(ggml_context* ctx, ggml_tensor* x,
                                const tada_codec_dec_block& blk, int stride) {
-    x = snake1d(ctx, x, blk.snake_alpha);
+    x = snake1d(ctx, x, blk.snake_alpha, blk.inv_snake_alpha);
     x = wn_convt1d(ctx, x, blk.up_conv, stride);
     static const int dilations[3] = {1, 3, 9};
     for (int r = 0; r < 3; r++) {
@@ -404,7 +481,7 @@ static ggml_cgraph* build_decode_graph(tada_codec_context* c, int n_frames) {
     }
 
     // Output: Snake → Conv1d(96, 1, k=7) → Tanh
-    cur = snake1d(ctx0, cur, c->out_snake_alpha);
+    cur = snake1d(ctx0, cur, c->out_snake_alpha, c->out_inv_snake_alpha);
     cur = wn_conv1d(ctx0, cur, c->out_conv, /*dilation*/1);
     cur = ggml_tanh(ctx0, cur);
 
@@ -466,6 +543,9 @@ struct tada_codec_context* tada_codec_init_from_file(const char* path, int n_thr
         delete c;
         return nullptr;
     }
+
+    // Pre-compute 1/alpha for all Snake1d activations (avoids fused snake op)
+    precompute_all_inv_alphas(c);
 
     fprintf(stderr, "tada-codec: loaded OK (%zu tensors)\n", c->tensors.size());
     return c;
