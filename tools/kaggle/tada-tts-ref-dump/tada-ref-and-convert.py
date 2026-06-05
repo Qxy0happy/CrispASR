@@ -108,12 +108,11 @@ print(f"[cell 3] codec_dir: {codec_dir}")
 # %% [code]
 # ── Cell 4: run reference dump ──
 kh.step("running reference dump")
-os.environ["TADA_SYN_TEXT"] = "Hello world."
-os.environ["TADA_NUM_FM_STEPS"] = "10"
-os.environ["TADA_CFG_SCALE"] = "1.0"
-os.environ["TADA_NOISE_TEMP"] = "0.0"
+os.environ["TADA_SYN_TEXT"] = "Please call Stella."
+os.environ["TADA_PROMPT_TEXT"] = "And so my fellow Americans, ask not what your country can do for you, ask what you can do for your country."
 os.environ["TADA_SEED"] = "42"
 os.environ["TADA_DEVICE"] = "cpu"
+os.environ["TADA_WAV_OUTPUT"] = str(WORK / "tada-ref-output.wav")
 os.environ["TADA_CODEC_DIR"] = str(codec_dir)
 
 ref_output = WORK / "tada-ref.gguf"
