@@ -255,6 +255,7 @@ extern "C" struct openvoice2_context* openvoice2_init_from_file(const char* path
     auto* ctx = new openvoice2_context();
     ctx->verbosity = params.verbosity;
     ctx->tau = params.tau;
+    { const char* e = std::getenv("OV2_TAU"); if (e) ctx->tau = std::atof(e); }
     ctx->rng.seed(42);
 
     // Pass 1: metadata

@@ -109,9 +109,13 @@ public:
                     cp.n_threads = p.n_threads;
                     cp.verbosity = p.no_prints ? 0 : 1;
                     ov2_ctx_ = openvoice2_init_from_file(tcc_path.c_str(), cp);
-                    if (ov2_ctx_ && !p.no_prints)
-                        fprintf(stderr, "melotts: OpenVoice2 TCC loaded from '%s'\n",
-                                tcc_path.c_str());
+                    if (ov2_ctx_) {
+                        const char* dump_dir = std::getenv("OV2_DUMP_DIR");
+                        if (dump_dir) openvoice2_set_dump_dir(ov2_ctx_, dump_dir);
+                        if (!p.no_prints)
+                            fprintf(stderr, "melotts: OpenVoice2 TCC loaded from '%s'\n",
+                                    tcc_path.c_str());
+                    }
                     break;
                 }
             }
