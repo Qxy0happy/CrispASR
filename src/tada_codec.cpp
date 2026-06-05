@@ -18,7 +18,6 @@
 
 #include "tada_codec.h"
 #include "core/gguf_loader.h"
-#include "core/activation.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -42,11 +41,9 @@
 
 namespace {
 
-// Weight-normed conv: weight = g * v / ||v||
-// original0 = g (magnitude), original1 = v (direction)
+// Conv weight (pre-materialized from weight-norm g*v/||v|| by the converter)
 struct wn_conv {
-    ggml_tensor* g = nullptr;   // original0: magnitude
-    ggml_tensor* v = nullptr;   // original1: direction (the actual weight shape)
+    ggml_tensor* w = nullptr;   // materialized weight
     ggml_tensor* b = nullptr;   // bias
 };
 
@@ -125,10 +122,13 @@ struct tada_codec_context {
 
 static void bind_wn(tada_codec_context* c, wn_conv& wn, const char* prefix) {
     char key[256];
-    snprintf(key, sizeof(key), "%s.parametrizations.weight.original0", prefix);
-    wn.g = core_gguf::try_get(c->tensors, key);
-    snprintf(key, sizeof(key), "%s.parametrizations.weight.original1", prefix);
-    wn.v = core_gguf::try_get(c->tensors, key);
+    // Try materialized weight first, fall back to raw direction tensor
+    snprintf(key, sizeof(key), "%s.weight", prefix);
+    wn.w = core_gguf::try_get(c->tensors, key);
+    if (!wn.w) {
+        snprintf(key, sizeof(key), "%s.parametrizations.weight.original1", prefix);
+        wn.w = core_gguf::try_get(c->tensors, key);
+    }
     snprintf(key, sizeof(key), "%s.bias", prefix);
     wn.b = core_gguf::try_get(c->tensors, key);
 }
@@ -257,12 +257,9 @@ static void precompute_all_inv_alphas(tada_codec_context* c) {
     (void)inv_ctx;
 }
 
-// Get the effective weight for a weight-normed conv.
-// For now, use v (direction) directly — the magnitude normalization
-// is approximate but produces audio. TODO: pre-materialize w = g*v/||v||
-// in the GGUF converter for exact weight-norm reconstruction.
+// Get the materialized weight (pre-computed g*v/||v|| by the converter).
 static inline ggml_tensor* wn_weight(const wn_conv& wn) {
-    return wn.v; // original1 = direction tensor
+    return wn.w;
 }
 
 // Snake1d: y = x + sin²(alpha * x) / alpha

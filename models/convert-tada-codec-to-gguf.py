@@ -172,10 +172,50 @@ def main():
     w.add_array("tada_codec.strides", strides)
     u32("tada_codec.sample_rate", 24000)
 
+    # ── Pre-materialize weight-normed convolutions ──
+    # PyTorch weight_norm stores parametrizations.weight.original0 (g, magnitude)
+    # and parametrizations.weight.original1 (v, direction). The actual weight is
+    # w = g * v / ||v||. We compute this at conversion time and store a single
+    # .weight tensor in the GGUF.
+    wn_pairs = {}  # prefix → {"g": tensor, "v": tensor}
+    for hf_name in sorted(name_to_idx.keys()):
+        if ".parametrizations.weight.original0" in hf_name:
+            prefix = hf_name.replace(".parametrizations.weight.original0", "")
+            wn_pairs.setdefault(prefix, {})["g"] = hf_name
+        elif ".parametrizations.weight.original1" in hf_name:
+            prefix = hf_name.replace(".parametrizations.weight.original1", "")
+            wn_pairs.setdefault(prefix, {})["v"] = hf_name
+
+    materialized = {}  # hf_prefix → numpy weight
+    for prefix, pair in wn_pairs.items():
+        if "g" in pair and "v" in pair:
+            g = handles[name_to_idx[pair["g"]]].get_tensor(pair["g"]).to(torch.float32)
+            v = handles[name_to_idx[pair["v"]]].get_tensor(pair["v"]).to(torch.float32)
+            # g shape: (1, 1, C_out) or (C_out, 1, 1) — flatten to (C_out,)
+            g_flat = g.reshape(-1)
+            # v shape: (K, C_in_or_out, C_out_or_in) — norm over all dims except last
+            v_flat = v.reshape(-1, v.shape[-1])  # (K*C_mid, C_out)
+            v_norm = torch.linalg.norm(v_flat, dim=0, keepdim=True)  # (1, C_out)
+            w = v * (g_flat / (v_norm.squeeze(0) + 1e-12)).reshape(1, 1, -1)
+            materialized[prefix] = w.numpy()
+            print(f"  WN materialized: {prefix}  g={list(g.shape)}  v={list(v.shape)} → w={list(w.shape)}")
+
     # ── Map tensors ──
     n_mapped = 0
     n_skipped = 0
+    skip_wn_raw = set()
+    for prefix in wn_pairs:
+        if "g" in wn_pairs[prefix]:
+            skip_wn_raw.add(wn_pairs[prefix]["g"])
+        if "v" in wn_pairs[prefix]:
+            skip_wn_raw.add(wn_pairs[prefix]["v"])
+
     for hf_name in sorted(name_to_idx.keys()):
+        # Skip raw weight-norm tensors (replaced by materialized weights)
+        if hf_name in skip_wn_raw:
+            n_skipped += 1
+            continue
+
         gn = map_tensor_name(hf_name)
         if gn is None:
             n_skipped += 1
@@ -183,7 +223,6 @@ def main():
 
         t = handles[name_to_idx[hf_name]].get_tensor(hf_name).to(torch.float32).numpy()
 
-        # Weight-normed layers store weight_v and weight_g — both needed
         if t.ndim <= 1:
             t = np.ascontiguousarray(t.astype(np.float32))
             w.add_tensor(gn, t, raw_dtype=GGMLQuantizationType.F32)
@@ -193,6 +232,22 @@ def main():
         n_mapped += 1
         if n_mapped <= 30 or n_mapped % 50 == 0:
             print(f"  [{n_mapped}] {gn:60s} {t.shape}  {t.dtype}")
+
+    # Add materialized weight-norm tensors
+    for prefix, wt in materialized.items():
+        # Map the prefix through the same name mapping, adding ".weight"
+        gn = map_tensor_name(prefix + ".weight")
+        if gn is None:
+            gn = map_tensor_name(prefix + ".") # try with trailing dot
+            if gn:
+                gn = gn.rstrip(".") + ".weight"
+        if gn is None:
+            print(f"  WARN: could not map WN prefix {prefix}", file=sys.stderr)
+            continue
+        t = np.ascontiguousarray(wt.astype(out_dtype))
+        w.add_tensor(gn, t, raw_dtype=out_qt)
+        n_mapped += 1
+        print(f"  [{n_mapped}] {gn:60s} {t.shape}  {t.dtype}  (WN materialized)")
 
     print(f"\nMapped: {n_mapped}, skipped: {n_skipped}")
     print(f"Writing {out_path}…")
