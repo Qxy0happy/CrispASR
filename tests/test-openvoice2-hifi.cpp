@@ -8,7 +8,7 @@
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <openvoice2-tcc.gguf>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <openvoice2-tcc.gguf> [src.wav] [ref.wav]\n", argv[0]);
         return 1;
     }
 
@@ -23,17 +23,19 @@ int main(int argc, char** argv) {
     const char* dump_dir = getenv("OV2_DUMP_DIR");
     if (dump_dir) openvoice2_set_dump_dir(ctx, dump_dir);
 
-    // Test: convert JFK audio with itself as reference (identity test)
-    // Read JFK WAV
-    const char* jfk_path = "samples/jfk.wav";
-    FILE* f = fopen(jfk_path, "rb");
+    // Load source and reference WAVs
+    const char* src_path = (argc >= 3) ? argv[2] : "samples/jfk.wav";
+    const char* ref_path = (argc >= 4) ? argv[3] : src_path;
+
+    // Read source WAV
+    FILE* f = fopen(src_path, "rb");
     if (!f) {
-        // Try from build dir
-        jfk_path = "../samples/jfk.wav";
-        f = fopen(jfk_path, "rb");
+        const char* alt = "../samples/jfk.wav";
+        f = fopen(alt, "rb");
+        if (f) src_path = alt;
     }
     if (!f) {
-        fprintf(stderr, "Cannot open %s\n", jfk_path);
+        fprintf(stderr, "Cannot open %s\n", src_path);
         openvoice2_free(ctx);
         return 1;
     }
@@ -63,12 +65,41 @@ int main(int argc, char** argv) {
         }
         pos += 8 + csz;
     }
-    fprintf(stderr, "Loaded %zu samples @ %d Hz\n", pcm.size(), sr);
+    fprintf(stderr, "Loaded source: %zu samples @ %d Hz from %s\n", pcm.size(), sr, src_path);
+
+    // Load reference WAV (may be same as source)
+    std::vector<float> ref_pcm = pcm;
+    int ref_sr = sr;
+    if (strcmp(src_path, ref_path) != 0) {
+        FILE* rf = fopen(ref_path, "rb");
+        if (rf) {
+            fseek(rf, 0, SEEK_END);
+            long rsize = ftell(rf); fseek(rf, 0, SEEK_SET);
+            std::vector<uint8_t> rdata(rsize);
+            fread(rdata.data(), 1, rsize, rf); fclose(rf);
+            size_t rpos = 12; int rbits = 16;
+            while (rpos < rdata.size() - 8) {
+                uint32_t rcsz = *(uint32_t*)(rdata.data() + rpos + 4);
+                if (memcmp(rdata.data()+rpos, "fmt ", 4) == 0) {
+                    ref_sr = *(int32_t*)(rdata.data()+rpos+12);
+                    rbits = *(int16_t*)(rdata.data()+rpos+22);
+                } else if (memcmp(rdata.data()+rpos, "data", 4) == 0) {
+                    int rn = rcsz / (rbits/8);
+                    ref_pcm.resize(rn);
+                    const int16_t* rs = (const int16_t*)(rdata.data()+rpos+8);
+                    for (int i = 0; i < rn; i++) ref_pcm[i] = rs[i] / 32768.0f;
+                    break;
+                }
+                rpos += 8 + rcsz;
+            }
+            fprintf(stderr, "Loaded ref: %zu samples @ %d Hz from %s\n", ref_pcm.size(), ref_sr, ref_path);
+        }
+    }
 
     float* out = nullptr;
     int n_out = 0;
     bool ok = openvoice2_convert(ctx, pcm.data(), (int)pcm.size(), sr,
-                                  pcm.data(), (int)pcm.size(), sr,
+                                  ref_pcm.data(), (int)ref_pcm.size(), ref_sr,
                                   &out, &n_out);
 
     if (ok && out && n_out > 0) {
